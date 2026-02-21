@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+
+{% block head %}
+<style>
+    /* Prevent text selection when drawing */
+    .no-select {
+        user-select: none;
+        -webkit-user-select: none;
+    }
+
+    #editor-container {
+        touch-action: none;
+        overflow: hidden;
+    }
+</style>
+<script>
+    // Pass data to Javascript
+    window.DATASET_NAME = "{{ dataset_name }}";
+    window.IMAGE_URL = "{{ image_url }}";
+    window.LABEL_URL = "{{ label_url }}";
+    window.CLASSES = {{ classes | tojson }};
+</script>
+{% endblock %}
+
+{% block nav_actions %}
+<a href="/dataset/{{ dataset_name }}"
+    class="px-4 py-2 text-sm font-medium rounded-lg bg-slate-800 text-slate-300 hover:bg-slate-700 hover:text-white transition-colors border border-slate-700">
+    &larr; Exit Editor
+</a>
+<button id="save-btn"
+    class="px-4 py-2 text-sm font-bold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition-colors shadow-lg shadow-indigo-500/20">
+    Save Labels
+</button>
+{% endblock %}
+
+{% block content %}
+<div class="flex flex-col lg:flex-row gap-6 h-[calc(100vh-10rem)]">
+    <!-- Tools & Classes sidebar -->
+    <div class="lg:w-64 flex-shrink-0 flex flex-col gap-6 h-full">
+        <!-- Classes Tool -->
+        <div class="glass-panel p-4 flex flex-col flex-grow min-h-0">
+            <h3
+                class="flex items-center justify-between text-xs font-bold uppercase tracking-wider text-slate-300 mb-4 pb-2 border-b border-slate-700/50">
+                ACTIVE CLASS
+            </h3>
+
+            <div id="class-list-container" class="space-y-2">
+                {% for name in classes %}
+                <button
+                    class="class-selector w-full flex items-center gap-2 p-2 rounded text-left transition-colors {% if loop.index0 == 0 %}bg-indigo-500/20 border border-indigo-500/50 text-indigo-300{% else %}bg-slate-800/50 hover:bg-slate-700 text-slate-300 border border-transparent{% endif %}"
+                    data-class-id="{{ loop.index0 }}">
+                    <div class="w-3 h-3 rounded-sm class-color-indicator"
+                        style="background-color: hsl({{ (loop.index0 * 137.5) % 360 }}, 70%, 60%);"></div>
+                    <span class="text-sm truncate font-medium">{{ name }}</span>
+                </button>
+                {% endfor %}
+            </div>
+
+            <div class="mt-4 flex gap-2">
+                <input type="text" id="new-class-input" placeholder="New class..."
+                    class="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-indigo-500">
+                <button id="add-class-btn"
+                    class="bg-indigo-600 hover:bg-indigo-500 text-white px-2 py-1 rounded text-xs transition-colors">Add</button>
+            </div>
+        </div>
+
+        <!-- Instructions Panel -->
+        <div class="glass-panel p-4 text-xs text-slate-400">
+            <h3 class="font-bold uppercase tracking-wider text-slate-300 mb-2">Controls</h3>
+            <ul class="space-y-1.5 list-disc pl-4">
+                <li><span class="text-indigo-400 font-semibold">Left Click</span>: Add point</li>
+                <li><span class="text-indigo-400 font-semibold">L-Drag Point</span>: Move point</li>
+                <li><span class="text-indigo-400 font-semibold">Right Click</span>: Close poly / Del point</li>
+                <li><span class="text-indigo-400 font-semibold">Wheel</span>: Zoom In/Out</li>
+                <li><span class="text-indigo-400 font-semibold">Middle Drag</span>: Pan Canvas</li>
+                <li><span class="text-indigo-400 font-semibold">Ctrl+Z / Ctrl+Y</span>: Undo / Redo</li>
+                <li><span class="text-rose-400 font-semibold">Delete/Bksp</span>: Delete obj / point</li>
+                <li><span class="text-indigo-400 font-semibold">Esc</span>: Cancel drawing</li>
+            </ul>
+        </div>
+    </div>
+
+    <!-- Canvas Editor Area -->
+    <div class="flex-grow glass-panel relative overflow-hidden flex items-center justify-center p-0 no-select"
+        id="editor-container">
+        <!-- Background dotted pattern for transparency feeling -->
+        <div class="absolute inset-0 z-0 opacity-10 pointer-events-none"
+            style="background-image: radial-gradient(#cbd5e1 1px, transparent 1px); background-size: 20px 20px;"></div>
+
+        <!-- Loading spinner -->
+        <div id="loading" class="absolute z-50 flex items-center gap-3 text-indigo-400">
+            <svg class="animate-spin h-8 w-8 text-indigo-500" xmlns="http://www.w3.org/2000/svg" fill="none"
+                viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor"
+                    d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z">
+                </path>
+            </svg>
+            <span class="font-medium animate-pulse">Loading image...</span>
+        </div>
+
+        <!-- Hidden image element to load source -->
+        <img id="source-image" src="{{ image_url }}" class="hidden" alt="Source">
+
+        <!-- The actual interactive canvas -->
+        <canvas id="seg-canvas" class="z-10 cursor-crosshair opacity-0 transition-opacity duration-300"></canvas>
+    </div>
+</div>
+
+<!-- Add vanilla JS script -->
+<script src="/static/js/editor.js"></script>
+{% endblock %}

@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="max-w-4xl mx-auto w-full">
+    <div class="flex items-center justify-between mb-8">
+        <div>
+            <h1 class="text-3xl font-bold mb-2">Datasets</h1>
+            <p class="text-slate-400">Select a dataset to view or edit segmentation labels.</p>
+        </div>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+        {% for dataset in datasets %}
+        <a href="/dataset/{{ dataset }}" class="block group">
+            <div
+                class="glass-panel p-6 h-full transition-all duration-300 transform group-hover:-translate-y-1 group-hover:shadow-xl group-hover:border-indigo-500/50">
+                <div class="flex items-start justify-between mb-4">
+                    <div class="p-3 bg-indigo-500/20 rounded-lg text-indigo-400">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="none" viewBox="0 0 24 24"
+                            stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 002-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                        </svg>
+                    </div>
+                    <span
+                        class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                        Ready
+                    </span>
+                </div>
+                <h3 class="text-xl font-semibold mb-2 group-hover:text-indigo-400 transition-colors">{{ dataset }}</h3>
+                <p class="text-sm text-slate-400">Open to view classes, configuration, and segmentation masks.</p>
+            </div>
+        </a>
+        {% else %}
+        <div class="col-span-full glass-panel p-12 text-center text-slate-400 border-dashed">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-16 w-16 mx-auto mb-4 opacity-50" fill="none"
+                viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                    d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4" />
+            </svg>
+            <p class="text-lg">No datasets found in Directory.</p>
+            <p class="text-sm mt-2 opacity-75">Make sure datasets with data.yaml exist in the configured path.</p>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title | default('YOLO Segmentation Dataset Editor') }}</title>
+    <!-- Tailwind CSS (via CDN for rapid development aesthetics) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- htmx for dynamic interactions -->
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <style>
+        /* Custom basic styles */
+        body { background-color: #0f172a; color: #f8fafc; font-family: 'Inter', sans-serif; }
+        .glass-panel { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 0.75rem; }
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #64748b; }
+    </style>
+    {% block head %}{% endblock %}
+</head>
+<body class="min-h-screen flex flex-col antialiased selection:bg-indigo-500 selection:text-white">
+    <!-- Navbar -->
+    <nav class="glass-panel sticky top-0 z-50 px-6 py-4 mb-6 shadow-lg flex justify-between items-center mx-4 mt-4">
+        <a href="/" class="text-2xl font-bold tracking-tight bg-gradient-to-r from-indigo-400 to-cyan-400 bg-clip-text text-transparent hover:opacity-80 transition-opacity">
+            YOLO Seg-Editor
+        </a>
+        <div class="flex gap-4">
+            {% block nav_actions %}{% endblock %}
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="flex-grow container mx-auto px-4 pb-8 flex flex-col">
+        {% block content %}{% endblock %}
+    </main>
+
+    <!-- Footer -->
+    <footer class="text-center py-6 text-slate-500 text-sm mt-auto">
+        &copy; 2026 AI Dataset Tools
+    </footer>
+</body>
+</html>
