@@ -363,9 +363,13 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    document.getElementById('save-btn').addEventListener('click', async () => {
-        const btn = document.getElementById('save-btn');
+    window.saveLabels = async function (btnId = 'save-btn') {
+        const btn = document.getElementById(btnId);
+        if (!btn) return false;
         const originalText = btn.innerText;
+
+        // Handle inner elements if any (like svg/span inside button)
+        const originalHTML = btn.innerHTML;
         btn.innerText = "Saving...";
         btn.disabled = true;
 
@@ -390,23 +394,59 @@ document.addEventListener("DOMContentLoaded", () => {
             });
 
             if (resp.ok) {
-                btn.classList.replace('bg-indigo-600', 'bg-emerald-600');
+                btn.classList.remove('bg-indigo-600', 'bg-emerald-600');
+                btn.classList.add('bg-emerald-600');
                 btn.innerText = "Saved!";
+                setTimeout(() => {
+                    btn.innerHTML = originalHTML;
+                    btn.disabled = false;
+                    btn.classList.remove('bg-emerald-600', 'bg-rose-600');
+                    if (btnId === 'save-btn') btn.classList.add('bg-indigo-600');
+                    else btn.classList.add('bg-emerald-600');
+                }, 2000);
+                return true;
             } else {
                 throw new Error("Save failed");
             }
         } catch (e) {
-            btn.classList.replace('bg-indigo-600', 'bg-rose-600');
+            btn.classList.remove('bg-indigo-600', 'bg-emerald-600');
+            btn.classList.add('bg-rose-600');
             btn.innerText = "Error";
             console.error(e);
+            setTimeout(() => {
+                btn.innerHTML = originalHTML;
+                btn.disabled = false;
+                btn.classList.remove('bg-emerald-600', 'bg-rose-600');
+                if (btnId === 'save-btn') btn.classList.add('bg-indigo-600');
+                else btn.classList.add('bg-emerald-600');
+            }, 2000);
+            return false;
         }
+    }
 
-        setTimeout(() => {
-            btn.innerText = originalText;
-            btn.disabled = false;
-            btn.classList.remove('bg-emerald-600', 'bg-rose-600');
-            btn.classList.add('bg-indigo-600');
-        }, 2000);
+    const saveBtn = document.getElementById('save-btn');
+    if (saveBtn) saveBtn.addEventListener('click', () => window.saveLabels('save-btn'));
+
+    const saveNextBtn = document.getElementById('save-next-btn');
+    if (saveNextBtn) saveNextBtn.addEventListener('click', async () => {
+        const success = await window.saveLabels('save-next-btn');
+        if (success) {
+            try {
+                const resp = await fetch(`/api/dataset/${window.DATASET_NAME}/next_unlabeled`);
+                const data = await resp.json();
+                if (data.status === 'ok') {
+                    const params = new URLSearchParams(window.location.search);
+                    params.set('img', data.next_image);
+                    params.set('lbl', data.next_label);
+                    window.location.search = params.toString();
+                } else {
+                    alert('No more unlabeled images found in the entire dataset!');
+                }
+            } catch (e) {
+                console.error(e);
+                alert("Error connecting to server to find next image.");
+            }
+        }
     });
 
     // Coordinate Conversion

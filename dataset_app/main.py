@@ -459,3 +459,25 @@ async def api_upload_images(dataset_name: str, files: List[UploadFile] = File(..
             saved_files.append(file.filename)
             
     return {"status": "ok", "uploaded": len(saved_files)}
+
+@app.get("/api/dataset/{dataset_name}/next_unlabeled")
+async def api_next_unlabeled(dataset_name: str):
+    # Scan splits in order for an image without a label file
+    for split in ["train", "valid", "test", "val"]:
+        images_dir = DATASETS_DIR / dataset_name / split / "images"
+        labels_dir = DATASETS_DIR / dataset_name / split / "labels"
+        if not images_dir.exists():
+            continue
+            
+        for img_file in images_dir.glob("*.*"):
+            if img_file.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]:
+                label_file = labels_dir / (img_file.stem + ".txt")
+                if not label_file.exists() or label_file.stat().st_size == 0:
+                    return {
+                        "status": "ok",
+                        "next_image": f"/datasets/{dataset_name}/{split}/images/{img_file.name}",
+                        "next_label": f"/datasets/{dataset_name}/{split}/labels/{img_file.stem}.txt"
+                    }
+                    
+    return {"status": "none"}
+
