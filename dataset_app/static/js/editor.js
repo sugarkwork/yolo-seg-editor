@@ -49,9 +49,160 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     });
 
-    // Dynamic Class Addition
     const addClassBtn = document.getElementById('add-class-btn');
     const newClassInput = document.getElementById('new-class-input');
+
+    // Auto-Segment UI Setup
+    const modelSelector = document.getElementById('model-selector');
+    const autoSegmentBtn = document.getElementById('auto-segment-btn');
+    const aiStatus = document.getElementById('ai-status');
+    const aiError = document.getElementById('ai-error');
+
+    async function populateModels() {
+        if (!modelSelector) return;
+        try {
+            const resp = await fetch('/api/models');
+            if (resp.ok) {
+                const data = await resp.json();
+                modelSelector.innerHTML = '';
+                if (data.models.length === 0) {
+                    modelSelector.innerHTML = '<option value="">No models found in models/</option>';
+                    autoSegmentBtn.disabled = true;
+                } else {
+                    data.models.forEach(m => {
+                        const opt = document.createElement('option');
+                        opt.value = m;
+                        opt.textContent = m;
+                        modelSelector.appendChild(opt);
+                    });
+                    autoSegmentBtn.disabled = false;
+                }
+            } else {
+                modelSelector.innerHTML = '<option value="">Error fetching models</option>';
+            }
+        } catch (e) {
+            console.error("Failed to fetch models", e);
+        }
+    }
+
+    populateModels();
+
+    if (autoSegmentBtn) {
+        autoSegmentBtn.addEventListener('click', async () => {
+            const modelName = modelSelector.value;
+            if (!modelName) return;
+
+            autoSegmentBtn.disabled = true;
+            aiStatus.classList.remove('hidden');
+            aiError.classList.add('hidden');
+
+            try {
+                const payload = {
+                    dataset_name: window.DATASET_NAME,
+                    image_path: window.IMAGE_URL,
+                    model_name: modelName
+                };
+
+                const resp = await fetch('/api/auto_segment', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (resp.ok) {
+                    const data = await resp.json();
+                    if (data.polygons && data.polygons.length > 0) {
+                        const imgW = sourceImage.naturalWidth;
+                        const imgH = sourceImage.naturalHeight;
+
+                        data.polygons.forEach(p => {
+                            const absolutePoly = {
+                                classId: p.classId,
+                                points: p.points.map(pt => ({ x: pt.x * imgW, y: pt.y * imgH }))
+                            };
+                            polygons.push(absolutePoly);
+                        });
+                        saveHistory();
+                        draw();
+                    } else {
+                        aiError.textContent = "No objects detected.";
+                        aiError.classList.remove('hidden');
+                    }
+                } else {
+                    const errDetail = await resp.json().catch(() => ({}));
+                    aiError.textContent = "Error: " + (errDetail.detail || resp.statusText);
+                    aiError.classList.remove('hidden');
+                }
+            } catch (e) {
+                console.error(e);
+                aiError.textContent = "Network error connecting to inference server.";
+                aiError.classList.remove('hidden');
+            } finally {
+                autoSegmentBtn.disabled = false;
+                aiStatus.classList.add('hidden');
+            }
+        });
+    }
+
+    // Dataset Split UI
+    const splitSelector = document.getElementById('split-selector');
+    if (splitSelector) {
+        // window.IMAGE_URL = /datasets/dogcat/train/images/000.jpg
+        const parts = window.IMAGE_URL.split('/');
+        if (parts.length >= 5) {
+            splitSelector.value = parts[3];
+        }
+
+        splitSelector.addEventListener('change', async (e) => {
+            const targetSplit = e.target.value;
+            try {
+                // Auto-save polygons before moving just in case
+                if (polygons.length > 0) {
+                    const yoloPolygons = polygons.map(poly => {
+                        return {
+                            classId: poly.classId,
+                            points: poly.points.map(pt => ({
+                                x: pt.x / sourceImage.naturalWidth,
+                                y: pt.y / sourceImage.naturalHeight
+                            }))
+                        };
+                    });
+
+                    await fetch('/api/save_labels', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            dataset_name: window.DATASET_NAME,
+                            label_path: window.LABEL_URL,
+                            polygons: yoloPolygons
+                        })
+                    });
+                }
+
+                const resp = await fetch(`/api/dataset/${window.DATASET_NAME}/move_image`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ image_path: window.IMAGE_URL, target_split: targetSplit })
+                });
+
+                if (resp.ok) {
+                    const data = await resp.json();
+                    const newPathParams = new URLSearchParams(window.location.search);
+                    newPathParams.set('img', data.new_image_path);
+                    newPathParams.set('lbl', data.new_image_path.replace('/images/', '/labels/').replace(/\.[^/.]+$/, ".txt"));
+                    window.location.search = newPathParams.toString();
+                } else {
+                    alert("Failed to move image");
+                    window.location.reload();
+                }
+            } catch (err) {
+                console.error("Move error:", err);
+                alert("Network error moving image");
+                window.location.reload();
+            }
+        });
+    }
+
     if (addClassBtn && newClassInput) {
         addClassBtn.addEventListener('click', async () => {
             const className = newClassInput.value.trim();

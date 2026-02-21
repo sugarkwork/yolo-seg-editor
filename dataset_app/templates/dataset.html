@@ -118,23 +118,73 @@
 
         <!-- Dataset Stats -->
         <div class="glass-panel p-6">
-            <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-4">Distribution</h3>
-            <div class="flex justify-between items-center bg-slate-800/50 rounded-lg p-3 border border-slate-700">
+            <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-4">Distribution & Split</h3>
+            <div class="flex justify-between items-center bg-slate-800/50 rounded-lg p-3 border border-slate-700 mb-4">
                 <span class="text-slate-400">Total Images</span>
                 <span class="text-xl font-bold text-white">{{ images | length }}</span>
+            </div>
+
+            <div class="flex flex-col gap-2">
+                <button onclick="document.getElementById('upload-input').click()"
+                    class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2 px-4 rounded transition-colors flex justify-center items-center gap-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24"
+                        stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                    </svg>
+                    Upload Images
+                </button>
+                <input type="file" id="upload-input" multiple accept="image/*" class="hidden"
+                    onchange="handleImageUpload(event)">
+
+                <button onclick="document.getElementById('auto-split-modal').classList.remove('hidden')"
+                    class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2 px-4 rounded transition-colors flex justify-center items-center gap-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24"
+                        stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                    Auto Split Dataset
+                </button>
             </div>
         </div>
     </div>
 
     <!-- Main View / Gallery -->
     <div class="xl:col-span-3 glass-panel p-6 flex flex-col h-[calc(100vh-10rem)]">
-        <h3 class="text-xl font-bold mb-4">Image Gallery</h3>
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
+            <h3 class="text-xl font-bold">Image Gallery</h3>
+            <div class="flex flex-wrap gap-2 items-center">
+                <select id="filter-status" onchange="runFilters()"
+                    class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-indigo-500">
+                    <option value="all">All Status</option>
+                    <option value="labeled">Labeled</option>
+                    <option value="unlabeled">Unlabeled</option>
+                </select>
+                <select id="filter-split" onchange="runFilters()"
+                    class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-indigo-500">
+                    <option value="all">All Splits</option>
+                    <option value="train">Train</option>
+                    <option value="valid">Valid</option>
+                    <option value="test">Test</option>
+                </select>
+                <select id="filter-class" onchange="runFilters()"
+                    class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-indigo-500">
+                    <option value="all">All Classes</option>
+                    {% for cls in classes %}
+                    <option value="{{ loop.index0 }}">{{ cls }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+        </div>
 
         <div class="flex-grow overflow-y-auto pr-2 custom-scrollbar">
             <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
                 {% for img in images %}
                 <a href="/editor/{{ dataset_name }}?img={{ img.path }}&lbl={{ img.label_path }}"
-                    class="block group relative rounded-lg overflow-hidden border border-slate-700 hover:border-indigo-500 transition-colors aspect-square bg-slate-900">
+                    class="gallery-item block group relative rounded-lg overflow-hidden border border-slate-700 hover:border-indigo-500 transition-colors aspect-square bg-slate-900"
+                    data-split="{{ img.split }}" data-labeled="{{ 'true' if img.has_label else 'false' }}"
+                    data-classes="{{ img.classes_present | join(',') }}">
                     <img src="{{ img.path }}" alt="{{ img.name }}"
                         class="object-cover w-full h-full opacity-80 group-hover:opacity-100 transition-opacity"
                         loading="lazy">
@@ -153,24 +203,73 @@
                         </div>
                     </div>
 
-                    <div
-                        class="absolute top-2 right-2 px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider bg-black/60 text-white backdrop-blur-sm border border-white/10">
-                        {{ img.split }}
-                    </div>
+                    <select onclick="event.preventDefault();" onchange="moveImage('{{ img.path }}', this.value)"
+                        class="absolute top-2 right-2 px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-black/70 hover:bg-black text-white backdrop-blur-sm border border-white/20 focus:outline-none cursor-pointer appearance-none transition-colors text-center shadow-lg z-20">
+                        <option value="train" {% if img.split=='train' %}selected{% endif %}>TRAIN ▾</option>
+                        <option value="valid" {% if img.split=='valid' %}selected{% endif %}>VALID ▾</option>
+                        <option value="test" {% if img.split=='test' %}selected{% endif %}>TEST ▾</option>
+                    </select>
                 </a>
                 {% endfor %}
             </div>
 
             {% if (images | length) == 0 %}
-            <div class="h-full flex flex-col items-center justify-center text-slate-500 pb-10">
+            <div id="no-images-msg" class="h-full flex flex-col items-center justify-center text-slate-500 pb-10">
                 <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 mb-3 opacity-50" fill="none"
                     viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                         d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
                 </svg>
-                <p>No images found in train, val, or test splits.</p>
+                <p>No images found matching criteria.</p>
+            </div>
+            {% else %}
+            <!-- Hidden filter message placeholder -->
+            <div id="no-images-msg" style="display: none;"
+                class="h-full flex flex-col items-center justify-center text-slate-500 pb-10">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 mb-3 opacity-50" fill="none"
+                    viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                        d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                </svg>
+                <p>No images match the selected filters.</p>
             </div>
             {% endif %}
+        </div>
+    </div>
+</div>
+
+<!-- Auto Split Modal -->
+<div id="auto-split-modal"
+    class="hidden fixed inset-0 bg-slate-900/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+    <div class="glass-panel p-6 max-w-sm w-full border border-slate-700">
+        <h3 class="text-lg font-bold text-white mb-2">Auto Split Dataset</h3>
+        <p class="text-xs text-slate-400 mb-4">Randomly shuffle and distribute all images into train, valid, and test
+            sets. Labels will be moved automatically.</p>
+
+        <div class="space-y-3 mb-6">
+            <div>
+                <label class="block text-xs font-semibold text-slate-300 mb-1">Train Ratio</label>
+                <input type="number" id="split-train" value="0.8" step="0.1" min="0" max="1"
+                    class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500">
+            </div>
+            <div>
+                <label class="block text-xs font-semibold text-slate-300 mb-1">Valid Ratio</label>
+                <input type="number" id="split-valid" value="0.1" step="0.1" min="0" max="1"
+                    class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500">
+            </div>
+            <div>
+                <label class="block text-xs font-semibold text-slate-300 mb-1">Test Ratio</label>
+                <input type="number" id="split-test" value="0.1" step="0.1" min="0" max="1"
+                    class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500">
+            </div>
+        </div>
+
+        <div class="flex gap-3">
+            <button onclick="document.getElementById('auto-split-modal').classList.add('hidden')"
+                class="flex-1 bg-slate-700 hover:bg-slate-600 text-white font-medium py-2 rounded transition-colors text-sm">Cancel</button>
+            <button onclick="submitAutoSplit()"
+                class="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2 rounded transition-colors text-sm">Apply
+                Split</button>
         </div>
     </div>
 </div>
@@ -187,6 +286,79 @@
         });
         if (resp.ok) window.location.reload();
         else alert('Error occurred');
+    }
+
+    // Filter Logic
+    function runFilters() {
+        const valStatus = document.getElementById('filter-status').value;
+        const valSplit = document.getElementById('filter-split').value;
+        const valClass = document.getElementById('filter-class').value;
+
+        const items = document.querySelectorAll('.gallery-item');
+        let visibleCount = 0;
+
+        items.forEach(item => {
+            const split = item.dataset.split;
+            const labeled = item.dataset.labeled;
+            const classes = item.dataset.classes ? item.dataset.classes.split(',') : [];
+
+            let show = true;
+
+            if (valStatus !== 'all') {
+                if (valStatus === 'labeled' && labeled === 'false') show = false;
+                if (valStatus === 'unlabeled' && labeled === 'true') show = false;
+            }
+
+            if (valSplit !== 'all' && split !== valSplit) {
+                show = false;
+            }
+
+            if (valClass !== 'all' && !classes.includes(valClass)) {
+                show = false;
+            }
+
+            if (show) {
+                item.style.display = 'block';
+                visibleCount++;
+            } else {
+                item.style.display = 'none';
+            }
+        });
+
+        const noImagesMsg = document.getElementById('no-images-msg');
+        if (noImagesMsg) {
+            noImagesMsg.style.display = visibleCount === 0 ? 'flex' : 'none';
+        }
+    }
+
+    // Upload Logic
+    async function handleImageUpload(e) {
+        const files = e.target.files;
+        if (!files.length) return;
+
+        const formData = new FormData();
+        for (let i = 0; i < files.length; i++) {
+            formData.append('files', files[i]);
+        }
+
+        try {
+            // we could show a spinner here
+            document.querySelector("label[for='upload-input']") || console.log('Uploading...');
+            const resp = await fetch(`/api/dataset/${datasetName}/upload_images`, {
+                method: 'POST',
+                body: formData
+            });
+
+            if (resp.ok) {
+                window.location.reload();
+            } else {
+                const err = await resp.json().catch(() => ({}));
+                alert(err.detail || "Error uploading images.");
+            }
+        } catch (err) {
+            console.error(err);
+            alert("Network error.");
+        }
     }
 
     function submitNewClass() {
@@ -237,6 +409,59 @@
         } else {
             alert("Invalid target ID");
             input.focus();
+        }
+    }
+
+    async function submitAutoSplit() {
+        const train = parseFloat(document.getElementById('split-train').value);
+        const valid = parseFloat(document.getElementById('split-valid').value);
+        const test = parseFloat(document.getElementById('split-test').value);
+
+        if (Math.abs(train + valid + test - 1.0) > 0.01) {
+            alert("Ratios must sum to 1.0");
+            return;
+        }
+
+        const btn = document.querySelector('#auto-split-modal button.bg-indigo-600');
+        const originalText = btn.innerText;
+        btn.innerText = "Splitting...";
+        btn.disabled = true;
+
+        try {
+            const resp = await fetch(`/api/dataset/${datasetName}/auto_split`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ train_ratio: train, valid_ratio: valid, test_ratio: test })
+            });
+            if (resp.ok) {
+                window.location.reload();
+            } else {
+                const err = await resp.json().catch(() => ({}));
+                alert(err.detail || "Error splitting dataset");
+            }
+        } catch (e) {
+            alert("Network error");
+        }
+        btn.innerText = originalText;
+        btn.disabled = false;
+    }
+
+    async function moveImage(imagePath, targetSplit) {
+        try {
+            const resp = await fetch(`/api/dataset/${datasetName}/move_image`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ image_path: imagePath, target_split: targetSplit })
+            });
+            if (resp.ok) {
+                window.location.reload();
+            } else {
+                alert("Error moving image");
+                window.location.reload();
+            }
+        } catch (e) {
+            alert("Network error");
+            window.location.reload();
         }
     }
 </script>
