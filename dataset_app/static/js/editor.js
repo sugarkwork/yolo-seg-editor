@@ -449,6 +449,95 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     });
 
+    const prevImgBtn = document.getElementById('prev-img-btn');
+    if (prevImgBtn) prevImgBtn.addEventListener('click', async () => {
+        try {
+            const resp = await fetch(`/api/dataset/${window.DATASET_NAME}/prev_image?current_image=${encodeURIComponent(window.IMAGE_URL)}`);
+            const data = await resp.json();
+            if (data.status === 'ok') {
+                const params = new URLSearchParams(window.location.search);
+                params.set('img', data.prev.image_url);
+                params.set('lbl', data.prev.label_url);
+                window.location.search = params.toString();
+            } else {
+                alert('No previous image found.');
+            }
+        } catch (e) {
+            console.error(e);
+            alert("Error connecting to server to find previous image.");
+        }
+    });
+
+    const nextImgBtn = document.getElementById('next-img-btn');
+    if (nextImgBtn) nextImgBtn.addEventListener('click', async () => {
+        try {
+            const resp = await fetch(`/api/dataset/${window.DATASET_NAME}/next_image?current_image=${encodeURIComponent(window.IMAGE_URL)}`);
+            const data = await resp.json();
+            if (data.status === 'ok') {
+                const params = new URLSearchParams(window.location.search);
+                params.set('img', data.next.image_url);
+                params.set('lbl', data.next.label_url);
+                window.location.search = params.toString();
+            } else {
+                alert('No next image found.');
+            }
+        } catch (e) {
+            console.error(e);
+            alert("Error connecting to server to find next image.");
+        }
+    });
+
+    const deleteImgBtn = document.getElementById('delete-image-btn');
+    if (deleteImgBtn) deleteImgBtn.addEventListener('click', async () => {
+        if (!confirm("Are you sure you want to permanently delete this image and its labels from the dataset?")) {
+            return;
+        }
+
+        const originalText = deleteImgBtn.innerHTML;
+        deleteImgBtn.innerHTML = "Deleting...";
+        deleteImgBtn.disabled = true;
+
+        try {
+            // Find next image URL before deleting
+            const nextResp = await fetch(`/api/dataset/${window.DATASET_NAME}/next_image?current_image=${encodeURIComponent(window.IMAGE_URL)}`);
+            const nextData = await nextResp.json();
+            let nextUrl = null;
+            if (nextResp.ok && nextData.status === 'ok' && nextData.next.image_url !== window.IMAGE_URL) {
+                const params = new URLSearchParams(window.location.search);
+                params.set('img', nextData.next.image_url);
+                params.set('lbl', nextData.next.label_url);
+                nextUrl = "?" + params.toString();
+            }
+
+            // Perform delete
+            const delResp = await fetch(`/api/dataset/${window.DATASET_NAME}/delete_image`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ image_path: window.IMAGE_URL })
+            });
+
+            if (delResp.ok) {
+                // Navigate away
+                if (nextUrl) {
+                    window.location.search = nextUrl;
+                } else {
+                    // No other images left
+                    window.location.href = `/dataset/${window.DATASET_NAME}`;
+                }
+            } else {
+                const err = await delResp.json().catch(() => ({}));
+                alert(err.detail || "Failed to delete image");
+                deleteImgBtn.innerHTML = originalText;
+                deleteImgBtn.disabled = false;
+            }
+        } catch (e) {
+            console.error(e);
+            alert("Network error while deleting image");
+            deleteImgBtn.innerHTML = originalText;
+            deleteImgBtn.disabled = false;
+        }
+    });
+
     // Coordinate Conversion
     function getMousePos(evt) {
         const rect = canvas.getBoundingClientRect();

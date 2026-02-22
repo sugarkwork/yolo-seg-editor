@@ -213,7 +213,7 @@
                         </div>
                     </div>
 
-                    <select onclick="event.preventDefault();" onchange="moveImage('{{ img.path }}', this.value)"
+                    <select onclick="event.preventDefault();" onchange="moveImage('{{ img.path }}', this.value, this)"
                         class="absolute top-2 right-2 px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-black/70 hover:bg-black text-white backdrop-blur-sm border border-white/20 focus:outline-none cursor-pointer appearance-none transition-colors text-center shadow-lg z-20">
                         <option value="train" {% if img.split=='train' %}selected{% endif %}>TRAIN ▾</option>
                         <option value="valid" {% if img.split=='valid' %}selected{% endif %}>VALID ▾</option>
@@ -456,7 +456,7 @@
         btn.disabled = false;
     }
 
-    async function moveImage(imagePath, targetSplit) {
+    async function moveImage(imagePath, targetSplit, selectElement) {
         try {
             const resp = await fetch(`/api/dataset/${datasetName}/move_image`, {
                 method: 'POST',
@@ -464,14 +464,28 @@
                 body: JSON.stringify({ image_path: imagePath, target_split: targetSplit })
             });
             if (resp.ok) {
-                window.location.reload();
+                // Update the DOM representation to reflect the new split if needed for filtering
+                if (selectElement) {
+                    const item = selectElement.closest('.gallery-item');
+                    if (item) {
+                        item.dataset.split = targetSplit;
+                        // Run filters again so the image disappears if it no longer matches the current filter
+                        runFilters();
+                    }
+
+                    // Optional: Visual feedback of success
+                    selectElement.classList.add('bg-indigo-600');
+                    selectElement.classList.remove('bg-black/70');
+                    setTimeout(() => {
+                        selectElement.classList.remove('bg-indigo-600');
+                        selectElement.classList.add('bg-black/70');
+                    }, 500);
+                }
             } else {
                 alert("Error moving image");
-                window.location.reload();
             }
         } catch (e) {
             alert("Network error");
-            window.location.reload();
         }
     }
 </script>

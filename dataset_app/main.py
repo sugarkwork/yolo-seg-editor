@@ -460,6 +460,46 @@ async def api_upload_images(dataset_name: str, files: List[UploadFile] = File(..
             
     return {"status": "ok", "uploaded": len(saved_files)}
 
+class DeleteImageRequest(BaseModel):
+    image_path: str
+
+@app.post("/api/dataset/{dataset_name}/delete_image")
+async def api_delete_image(dataset_name: str, req: DeleteImageRequest):
+    # Security: Ensure path is within the dataset
+    try:
+        # Expected format: /datasets/dataset_name/split/images/filename.jpg
+        # unquote and get path in case it's a full URL
+        image_url = urllib.parse.unquote(req.image_path)
+        if image_url.startswith("http"):
+            image_url = urllib.parse.urlparse(image_url).path
+            
+        parts = image_url.strip("/").split("/")
+        if len(parts) != 5 or parts[0] != "datasets" or parts[1] != dataset_name or parts[3] != "images":
+             raise HTTPException(status_code=400, detail="Invalid image path format")
+             
+        split = parts[2]
+        filename = parts[4]
+        
+        if split not in ["train", "valid", "test", "val"]:
+            raise HTTPException(status_code=400, detail="Invalid split")
+            
+        img_file = DATASETS_DIR / dataset_name / split / "images" / filename
+        
+        # Determine the label file
+        label_filename = os.path.splitext(filename)[0] + ".txt"
+        lbl_file = DATASETS_DIR / dataset_name / split / "labels" / label_filename
+        
+        if img_file.exists():
+            img_file.unlink()
+        
+        if lbl_file.exists():
+            lbl_file.unlink()
+            
+        return {"status": "ok"}
+    except Exception as e:
+        print(f"Delete image error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/dataset/{dataset_name}/next_unlabeled")
 async def api_next_unlabeled(dataset_name: str):
     # Scan splits in order for an image without a label file
@@ -469,7 +509,7 @@ async def api_next_unlabeled(dataset_name: str):
         if not images_dir.exists():
             continue
             
-        for img_file in images_dir.glob("*.*"):
+        for img_file in sorted(images_dir.glob("*.*")):
             if img_file.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]:
                 label_file = labels_dir / (img_file.stem + ".txt")
                 if not label_file.exists() or label_file.stat().st_size == 0:
@@ -480,4 +520,58 @@ async def api_next_unlabeled(dataset_name: str):
                     }
                     
     return {"status": "none"}
+
+def get_all_images(dataset_name: str):
+    images = []
+    # Using the same order as in gallery (read_dataset)
+    for split in ["train", "valid", "test", "val"]:
+        images_dir = DATASETS_DIR / dataset_name / split / "images"
+        if not images_dir.exists():
+            continue
+        for img_file in sorted(images_dir.glob("*.*")):
+            if img_file.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]:
+                images.append({
+                    "image_url": f"/datasets/{dataset_name}/{split}/images/{img_file.name}",
+                    "label_url": f"/datasets/{dataset_name}/{split}/labels/{img_file.stem}.txt"
+                })
+    return images
+
+import urllib.parse
+
+@app.get("/api/dataset/{dataset_name}/next_image")
+async def api_next_image(dataset_name: str, current_image: str):
+    images = get_all_images(dataset_name)
+    current_image = urllib.parse.unquote(current_image)
+    if current_image.startswith("http"):
+        current_image = urllib.parse.urlparse(current_image).path
+        
+    for i, img in enumerate(images):
+        if img["image_url"] == current_image:
+            if i + 1 < len(images):
+                return {"status": "ok", "next": images[i + 1]}
+            else:
+                # Wrap around to the first image
+                if len(images) > 0:
+                    return {"status": "ok", "next": images[0]}
+                break
+    return {"status": "none"}
+
+@app.get("/api/dataset/{dataset_name}/prev_image")
+async def api_prev_image(dataset_name: str, current_image: str):
+    images = get_all_images(dataset_name)
+    current_image = urllib.parse.unquote(current_image)
+    if current_image.startswith("http"):
+        current_image = urllib.parse.urlparse(current_image).path
+
+    for i, img in enumerate(images):
+        if img["image_url"] == current_image:
+            if i - 1 >= 0:
+                return {"status": "ok", "prev": images[i - 1]}
+            else:
+                # Wrap around to the last image
+                if len(images) > 0:
+                     return {"status": "ok", "prev": images[-1]}
+                break
+    return {"status": "none"}
+
 
