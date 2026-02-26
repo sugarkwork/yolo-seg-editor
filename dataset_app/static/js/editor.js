@@ -57,6 +57,8 @@ document.addEventListener("DOMContentLoaded", () => {
     const autoSegmentBtn = document.getElementById('auto-segment-btn');
     const aiStatus = document.getElementById('ai-status');
     const aiError = document.getElementById('ai-error');
+    const checkDiffBtn = document.getElementById('check-diff-btn');
+    const diffResult = document.getElementById('diff-result');
 
     async function populateModels() {
         if (!modelSelector) return;
@@ -139,6 +141,62 @@ document.addEventListener("DOMContentLoaded", () => {
                 aiError.classList.remove('hidden');
             } finally {
                 autoSegmentBtn.disabled = false;
+                aiStatus.classList.add('hidden');
+            }
+        });
+    }
+
+    if (checkDiffBtn) {
+        checkDiffBtn.addEventListener('click', async () => {
+            const modelName = modelSelector.value;
+            if (!modelName) {
+                alert("Please select a model first.");
+                return;
+            }
+
+            const origText = checkDiffBtn.textContent;
+            checkDiffBtn.textContent = 'Checking...';
+            checkDiffBtn.disabled = true;
+            aiStatus.classList.remove('hidden');
+            diffResult.classList.add('hidden');
+
+            try {
+                const payload = {
+                    dataset_name: window.DATASET_NAME,
+                    image_path: window.IMAGE_URL,
+                    model_name: modelName
+                };
+
+                const resp = await fetch(`/api/dataset/${window.DATASET_NAME}/auto_check_single`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (resp.ok) {
+                    const data = await resp.json();
+                    const diffScore = data.diff_score;
+
+                    diffResult.querySelector('.label-model').textContent = `Model: ${modelName}`;
+                    const scoreEl = diffResult.querySelector('.label-score');
+                    scoreEl.textContent = `Diff Score: ${diffScore.toFixed(4)}`;
+
+                    if (diffScore === 0) {
+                        scoreEl.className = 'text-emerald-400 font-bold text-lg label-score block mt-1';
+                    } else if (diffScore < 0.2) {
+                        scoreEl.className = 'text-amber-400 font-bold text-lg label-score block mt-1';
+                    } else {
+                        scoreEl.className = 'text-rose-400 font-bold text-lg label-score block mt-1';
+                    }
+
+                    diffResult.classList.remove('hidden');
+                } else {
+                    const errDetail = await resp.json().catch(() => ({}));
+                    alert("Error checking diff: " + (errDetail.detail || resp.statusText));
+                }
+            } finally {
+                checkDiffBtn.textContent = origText;
+                checkDiffBtn.disabled = false;
                 aiStatus.classList.add('hidden');
             }
         });

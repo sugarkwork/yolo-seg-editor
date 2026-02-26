@@ -6,6 +6,7 @@ import os
 import yaml
 import shutil
 import random
+import json
 from pathlib import Path
 from config import DATASETS_DIR, BASE_DIR, MODELS_DIR
 
@@ -47,6 +48,15 @@ async def read_dataset(request: Request, dataset_name: str):
     
     classes = data.get("names", [])
     
+    scores_file = DATASETS_DIR / dataset_name / "auto_check.json"
+    diff_scores = {}
+    if scores_file.exists():
+        try:
+            with open(scores_file, "r") as f:
+                diff_scores = json.load(f)
+        except Exception:
+            pass
+            
     # Let's find images (looking into train/images for now, or val/images, test/images)
     images = []
     stem_counts = {}
@@ -81,7 +91,8 @@ async def read_dataset(request: Request, dataset_name: str):
             "has_label": label_file.exists(),
             "split": split,
             "classes_present": list(classes_present),
-            "is_duplicate": stem_counts[img_file.stem] > 1
+            "is_duplicate": stem_counts[img_file.stem] > 1,
+            "diff_score": diff_scores.get(img_file.name, 0.0)
         })
     
     return templates.TemplateResponse(
@@ -324,6 +335,147 @@ async def api_auto_segment(req: AutoSegmentRequest):
             })
             
     return {"polygons": predicted_polygons}
+
+class AutoCheckRequest(BaseModel):
+    model_name: str
+
+@app.post("/api/dataset/{dataset_name}/auto_check")
+async def api_auto_check(dataset_name: str, req: AutoCheckRequest):
+    model_path = MODELS_DIR / req.model_name
+    if not model_path.exists():
+        raise HTTPException(status_code=404, detail="Model not found")
+        
+    try:
+        from ultralytics import YOLO
+        import numpy as np
+        import cv2
+    except ImportError:
+        raise HTTPException(status_code=500, detail="Missing required libraries for Auto Check")
+
+    model = YOLO(str(model_path))
+    scores = {}
+    
+    # Check all images in dataset
+    for split in ["train", "valid", "test", "val"]:
+        images_dir = DATASETS_DIR / dataset_name / split / "images"
+        labels_dir = DATASETS_DIR / dataset_name / split / "labels"
+        if not images_dir.exists(): continue
+        
+        for img_file in images_dir.glob("*.*"):
+            if img_file.suffix.lower() not in [".jpg", ".jpeg", ".png", ".webp"]: continue
+            
+            lbl_file = labels_dir / (img_file.stem + ".txt")
+            
+            # Predict
+            results = model.predict(source=str(img_file), save=False, conf=0.25, verbose=False)
+            res = results[0]
+            
+            # Create a 640x640 mask for rendering (to calculate IoU fast via rasterization)
+            H, W = 640, 640
+            gt_mask = np.zeros((H, W), dtype=np.uint8)
+            pred_mask = np.zeros((H, W), dtype=np.uint8)
+            
+            # Fill Ground Truth
+            if lbl_file.exists():
+                with open(lbl_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) >= 7 and len(parts) % 2 == 1:
+                            coords = [float(x) for x in parts[1:]]
+                            pts = np.array([ [int(coords[i]*W), int(coords[i+1]*H)] for i in range(0, len(coords), 2) ], dtype=np.int32)
+                            cv2.fillPoly(gt_mask, [pts], 1)
+                            
+            # Fill Predictions
+            if res.masks is not None:
+                for mask_xyn in res.masks.xyn:
+                    pts = np.array([ [int(x*W), int(y*H)] for x, y in mask_xyn ], dtype=np.int32)
+                    cv2.fillPoly(pred_mask, [pts], 1)
+                    
+            intersection = np.logical_and(gt_mask, pred_mask).sum()
+            union = np.logical_or(gt_mask, pred_mask).sum()
+            
+            if union == 0:
+                iou = 1.0 # both are empty -> perfect match
+            else:
+                iou = intersection / union
+                
+            diff = 1.0 - iou
+            scores[img_file.name] = round(diff, 4)
+            
+    scores_file = DATASETS_DIR / dataset_name / "auto_check.json"
+    with open(scores_file, "w") as f:
+        json.dump(scores, f)
+        
+    return {"status": "ok", "checked": len(scores)}
+
+class AutoCheckSingleRequest(BaseModel):
+    model_name: str
+    image_path: str
+    
+@app.post("/api/dataset/{dataset_name}/auto_check_single")
+async def api_auto_check_single(dataset_name: str, req: AutoCheckSingleRequest):
+    model_path = MODELS_DIR / req.model_name
+    if not model_path.exists():
+        raise HTTPException(status_code=404, detail="Model not found")
+        
+    try:
+        from ultralytics import YOLO
+        import numpy as np
+        import cv2
+    except ImportError:
+        raise HTTPException(status_code=500, detail="Missing required libraries for Auto Check")
+        
+    decoded_img_path = urllib.parse.unquote(req.image_path)
+    physical_img_path = BASE_DIR / decoded_img_path.lstrip("/")
+    
+    if not physical_img_path.exists():
+        raise HTTPException(status_code=404, detail="Image not found")
+        
+    model = YOLO(str(model_path))
+    
+    lbl_file = physical_img_path.parent.parent / "labels" / (physical_img_path.stem + ".txt")
+    
+    results = model.predict(source=str(physical_img_path), save=False, conf=0.25, verbose=False)
+    res = results[0]
+    
+    H, W = 640, 640
+    gt_mask = np.zeros((H, W), dtype=np.uint8)
+    pred_mask = np.zeros((H, W), dtype=np.uint8)
+    
+    if lbl_file.exists():
+        with open(lbl_file, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 7 and len(parts) % 2 == 1:
+                    coords = [float(x) for x in parts[1:]]
+                    pts = np.array([ [int(coords[i]*W), int(coords[i+1]*H)] for i in range(0, len(coords), 2) ], dtype=np.int32)
+                    cv2.fillPoly(gt_mask, [pts], 1)
+                    
+    if res.masks is not None:
+        for mask_xyn in res.masks.xyn:
+            pts = np.array([ [int(x*W), int(y*H)] for x, y in mask_xyn ], dtype=np.int32)
+            cv2.fillPoly(pred_mask, [pts], 1)
+            
+    intersection = np.logical_and(gt_mask, pred_mask).sum()
+    union = np.logical_or(gt_mask, pred_mask).sum()
+    
+    iou = 1.0 if union == 0 else intersection / union
+    diff = round(1.0 - iou, 4)
+    
+    scores_file = DATASETS_DIR / dataset_name / "auto_check.json"
+    scores = {}
+    if scores_file.exists():
+        try:
+            with open(scores_file, "r") as f:
+                scores = json.load(f)
+        except Exception:
+            pass
+            
+    scores[physical_img_path.name] = diff
+    with open(scores_file, "w") as f:
+        json.dump(scores, f)
+        
+    return {"status": "ok", "diff_score": diff, "image": physical_img_path.name}
 
 class AutoSplitRequest(BaseModel):
     train_ratio: float = 0.8
