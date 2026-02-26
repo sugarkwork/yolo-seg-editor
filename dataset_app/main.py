@@ -49,33 +49,40 @@ async def read_dataset(request: Request, dataset_name: str):
     
     # Let's find images (looking into train/images for now, or val/images, test/images)
     images = []
+    stem_counts = {}
+    all_img_files = []
     for split in ["train", "valid", "test", "val"]:
         split_dir = DATASETS_DIR / dataset_name / split / "images"
         if split_dir.exists():
             for img_file in split_dir.glob("*.*"):
                 if img_file.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]:
-                     labels_dir = DATASETS_DIR / dataset_name / split / "labels"
-                     label_file = labels_dir / (img_file.stem + ".txt")
+                     stem_counts[img_file.stem] = stem_counts.get(img_file.stem, 0) + 1
+                     all_img_files.append((split, img_file))
                      
-                     classes_present = set()
-                     if label_file.exists():
-                         with open(label_file, "r", encoding="utf-8") as lf:
-                             for line in lf:
-                                 parts = line.strip().split()
-                                 if parts:
-                                     try:
-                                         classes_present.add(int(parts[0]))
-                                     except ValueError:
-                                         pass
-                                         
-                     images.append({
-                         "name": img_file.name,
-                         "path": f"/datasets/{dataset_name}/{split}/images/{img_file.name}",
-                         "label_path": f"/datasets/{dataset_name}/{split}/labels/{label_file.name}",
-                         "has_label": label_file.exists(),
-                         "split": split,
-                         "classes_present": list(classes_present)
-                     })
+    for split, img_file in all_img_files:
+        labels_dir = DATASETS_DIR / dataset_name / split / "labels"
+        label_file = labels_dir / (img_file.stem + ".txt")
+        
+        classes_present = set()
+        if label_file.exists():
+            with open(label_file, "r", encoding="utf-8") as lf:
+                for line in lf:
+                    parts = line.strip().split()
+                    if parts:
+                        try:
+                            classes_present.add(int(parts[0]))
+                        except ValueError:
+                            pass
+                            
+        images.append({
+            "name": img_file.name,
+            "path": f"/datasets/{dataset_name}/{split}/images/{img_file.name}",
+            "label_path": f"/datasets/{dataset_name}/{split}/labels/{label_file.name}",
+            "has_label": label_file.exists(),
+            "split": split,
+            "classes_present": list(classes_present),
+            "is_duplicate": stem_counts[img_file.stem] > 1
+        })
     
     return templates.TemplateResponse(
         request=request, name="dataset.html", context={
@@ -446,17 +453,37 @@ from fastapi import UploadFile, File
 
 @app.post("/api/dataset/{dataset_name}/upload_images")
 async def api_upload_images(dataset_name: str, files: List[UploadFile] = File(...)):
+    existing_stems = set()
+    for split in ["train", "valid", "test", "val"]:
+        split_dir = DATASETS_DIR / dataset_name / split / "images"
+        if split_dir.exists():
+            for img_file in split_dir.glob("*.*"):
+                existing_stems.add(img_file.stem)
+                
     target_dir = DATASETS_DIR / dataset_name / "train" / "images"
     target_dir.mkdir(parents=True, exist_ok=True)
     
     saved_files = []
     for file in files:
         if file.filename:
-            file_path = target_dir / file.filename
+            original_path = Path(file.filename)
+            stem = original_path.stem
+            suffix = original_path.suffix
+            
+            new_stem = stem
+            counter = 1
+            while new_stem in existing_stems:
+                new_stem = f"{stem}_{counter}"
+                counter += 1
+                
+            existing_stems.add(new_stem)
+            new_filename = f"{new_stem}{suffix}"
+            file_path = target_dir / new_filename
+            
             with open(file_path, "wb") as f:
                 content = await file.read()
                 f.write(content)
-            saved_files.append(file.filename)
+            saved_files.append(new_filename)
             
     return {"status": "ok", "uploaded": len(saved_files)}
 

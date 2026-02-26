@@ -170,6 +170,7 @@
                     <option value="all">All Status</option>
                     <option value="labeled">Labeled</option>
                     <option value="unlabeled">Unlabeled</option>
+                    <option value="duplicate">Duplicates</option>
                 </select>
                 <select id="filter-split" onchange="runFilters()"
                     class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-indigo-500">
@@ -194,7 +195,8 @@
                 <a href="/editor/{{ dataset_name }}?img={{ img.path }}&lbl={{ img.label_path }}"
                     class="gallery-item block group relative rounded-lg overflow-hidden border border-slate-700 hover:border-indigo-500 transition-colors aspect-square bg-slate-900"
                     data-split="{{ img.split }}" data-labeled="{{ 'true' if img.has_label else 'false' }}"
-                    data-classes="{{ img.classes_present | join(',') }}">
+                    data-classes="{{ img.classes_present | join(',') }}"
+                    data-duplicate="{{ 'true' if img.is_duplicate else 'false' }}">
                     <img src="{{ img.path }}" alt="{{ img.name }}"
                         class="object-cover w-full h-full opacity-80 group-hover:opacity-100 transition-opacity"
                         loading="lazy">
@@ -209,6 +211,9 @@
                             {% else %}
                             <span class="w-2 h-2 rounded-full bg-slate-500 mr-1.5"></span>
                             <span class="text-[10px] text-slate-400 font-medium">Unlabeled</span>
+                            {% endif %}
+                            {% if img.is_duplicate %}
+                            <span class="ml-2 px-1 py-0.5 rounded bg-amber-500/20 text-[10px] text-amber-400 font-medium border border-amber-500/30">Dup</span>
                             {% endif %}
                         </div>
                     </div>
@@ -311,12 +316,14 @@
             const split = item.dataset.split;
             const labeled = item.dataset.labeled;
             const classes = item.dataset.classes ? item.dataset.classes.split(',') : [];
+            const isDuplicate = item.dataset.duplicate;
 
             let show = true;
 
             if (valStatus !== 'all') {
                 if (valStatus === 'labeled' && labeled === 'false') show = false;
                 if (valStatus === 'unlabeled' && labeled === 'true') show = false;
+                if (valStatus === 'duplicate' && isDuplicate === 'false') show = false;
             }
 
             if (valSplit !== 'all' && split !== valSplit) {
