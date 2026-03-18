@@ -211,6 +211,14 @@
                     <option value="{{ loop.index0 }}">{{ cls }}</option>
                     {% endfor %}
                 </select>
+                <button onclick="resetFilters()"
+                    class="bg-slate-700 hover:bg-slate-600 text-slate-300 hover:text-white px-2 py-1 text-xs rounded transition-colors flex items-center gap-1 border border-slate-600"
+                    title="Reset all filters">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                    Reset
+                </button>
             </div>
         </div>
 
@@ -324,7 +332,44 @@
 <script>
     const datasetName = "{{ dataset_name }}";
 
+    const STORAGE_KEY = `dataset_filters_${datasetName}`;
+
+    function saveFilterState() {
+        const state = {
+            sort: document.getElementById('sort-order').value,
+            status: document.getElementById('filter-status').value,
+            split: document.getElementById('filter-split').value,
+            cls: document.getElementById('filter-class').value
+        };
+        sessionStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    }
+
+    function restoreFilterState() {
+        const raw = sessionStorage.getItem(STORAGE_KEY);
+        if (!raw) return;
+        try {
+            const state = JSON.parse(raw);
+            if (state.sort) document.getElementById('sort-order').value = state.sort;
+            if (state.status) document.getElementById('filter-status').value = state.status;
+            if (state.split) document.getElementById('filter-split').value = state.split;
+            if (state.cls) document.getElementById('filter-class').value = state.cls;
+        } catch (e) { /* ignore corrupt data */ }
+    }
+
+    function resetFilters() {
+        document.getElementById('sort-order').value = 'name';
+        document.getElementById('filter-status').value = 'all';
+        document.getElementById('filter-split').value = 'all';
+        document.getElementById('filter-class').value = 'all';
+        sessionStorage.removeItem(STORAGE_KEY);
+        runFilters();
+    }
+
     document.addEventListener("DOMContentLoaded", async () => {
+        // Restore saved filter/sort state
+        restoreFilterState();
+        runFilters();
+
         try {
             const resp = await fetch("/api/models");
             if (resp.ok) {
@@ -357,6 +402,9 @@
         const valSplit = document.getElementById('filter-split').value;
         const valClass = document.getElementById('filter-class').value;
         const sortOrder = document.getElementById('sort-order')?.value || 'name';
+
+        // Persist state
+        saveFilterState();
 
         const items = document.querySelectorAll('.gallery-item');
         let visibleCount = 0;
