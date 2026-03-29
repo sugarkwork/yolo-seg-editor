@@ -316,9 +316,9 @@ async def api_auto_segment(req: AutoSegmentRequest):
         denoised_img = cv2.fastNlMeansDenoisingColored(
             img_bgr, None, float(req.h_lum), float(req.h_col), int(req.tw), int(req.sw)
         )
-        results = model.predict(source=denoised_img, save=False, conf=0.25)
+        results = model.predict(source=denoised_img, save=False, conf=0.25, retina_masks=True)
     else:
-        results = model.predict(source=str(physical_img_path), save=False, conf=0.25)
+        results = model.predict(source=str(physical_img_path), save=False, conf=0.25, retina_masks=True)
     
     result = results[0]
     
@@ -386,7 +386,7 @@ async def api_auto_check(dataset_name: str, req: AutoCheckRequest):
             lbl_file = labels_dir / (img_file.stem + ".txt")
             
             # Predict
-            results = model.predict(source=str(img_file), save=False, conf=0.25, verbose=False)
+            results = model.predict(source=str(img_file), save=False, conf=0.25, verbose=False, retina_masks=True)
             res = results[0]
             
             # Create a 640x640 mask for rendering (to calculate IoU fast via rasterization)
@@ -465,11 +465,11 @@ async def api_auto_check_single(dataset_name: str, req: AutoCheckSingleRequest):
             denoised_img = cv2.fastNlMeansDenoisingColored(
                 img_bgr, None, float(req.h_lum), float(req.h_col), int(req.tw), int(req.sw)
             )
-            results = model.predict(source=denoised_img, save=False, conf=0.25, verbose=False)
+            results = model.predict(source=denoised_img, save=False, conf=0.25, verbose=False, retina_masks=True)
         else:
-            results = model.predict(source=str(physical_img_path), save=False, conf=0.25, verbose=False)
+            results = model.predict(source=str(physical_img_path), save=False, conf=0.25, verbose=False, retina_masks=True)
     else:
-        results = model.predict(source=str(physical_img_path), save=False, conf=0.25, verbose=False)
+        results = model.predict(source=str(physical_img_path), save=False, conf=0.25, verbose=False, retina_masks=True)
         
     res = results[0]
     
