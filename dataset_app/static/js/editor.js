@@ -77,6 +77,13 @@ document.addEventListener("DOMContentLoaded", () => {
                         opt.textContent = m;
                         modelSelector.appendChild(opt);
                     });
+                    const lastModel = localStorage.getItem('last_auto_segment_model');
+                    if (lastModel && data.models.includes(lastModel)) {
+                        modelSelector.value = lastModel;
+                    }
+                    modelSelector.addEventListener('change', () => {
+                        localStorage.setItem('last_auto_segment_model', modelSelector.value);
+                    });
                     autoSegmentBtn.disabled = false;
                 }
             } else {
@@ -89,6 +96,52 @@ document.addEventListener("DOMContentLoaded", () => {
 
     populateModels();
 
+    const useDenoiseChk = document.getElementById('use-denoise-chk');
+    const denoiseParams = document.getElementById('denoise-params');
+    const dnHLum = document.getElementById('dn-h-lum');
+    const dnHCol = document.getElementById('dn-h-col');
+    const dnTw = document.getElementById('dn-tw');
+    const dnSw = document.getElementById('dn-sw');
+
+    function loadDenoiseSettings() {
+        if (!useDenoiseChk) return;
+        const saved = localStorage.getItem('dataset_editor_denoise_settings');
+        if (saved) {
+            try {
+                const s = JSON.parse(saved);
+                useDenoiseChk.checked = s.useDenoise || false;
+                if (s.hLum) dnHLum.value = s.hLum;
+                if (s.hCol) dnHCol.value = s.hCol;
+                if (s.tw) dnTw.value = s.tw;
+                if (s.sw) dnSw.value = s.sw;
+            } catch (e) {}
+        }
+        denoiseParams.classList.toggle('hidden', !useDenoiseChk.checked);
+    }
+
+    function saveDenoiseSettings() {
+        if (!useDenoiseChk) return;
+        const s = {
+            useDenoise: useDenoiseChk.checked,
+            hLum: parseFloat(dnHLum.value),
+            hCol: parseFloat(dnHCol.value),
+            tw: parseInt(dnTw.value, 10),
+            sw: parseInt(dnSw.value, 10)
+        };
+        localStorage.setItem('dataset_editor_denoise_settings', JSON.stringify(s));
+    }
+
+    if (useDenoiseChk) {
+        loadDenoiseSettings();
+        useDenoiseChk.addEventListener('change', () => {
+            denoiseParams.classList.toggle('hidden', !useDenoiseChk.checked);
+            saveDenoiseSettings();
+        });
+        [dnHLum, dnHCol, dnTw, dnSw].forEach(el => {
+            if (el) el.addEventListener('change', saveDenoiseSettings);
+        });
+    }
+
     if (autoSegmentBtn) {
         autoSegmentBtn.addEventListener('click', async () => {
             const modelName = modelSelector.value;
@@ -99,11 +152,21 @@ document.addEventListener("DOMContentLoaded", () => {
             aiError.classList.add('hidden');
 
             try {
+                localStorage.setItem('last_auto_segment_model', modelName);
+                
                 const payload = {
                     dataset_name: window.DATASET_NAME,
                     image_path: window.IMAGE_URL,
                     model_name: modelName
                 };
+                
+                if (useDenoiseChk && useDenoiseChk.checked) {
+                    payload.use_denoise = true;
+                    payload.h_lum = parseFloat(dnHLum.value);
+                    payload.h_col = parseFloat(dnHCol.value);
+                    payload.tw = parseInt(dnTw.value, 10);
+                    payload.sw = parseInt(dnSw.value, 10);
+                }
 
                 const resp = await fetch('/api/auto_segment', {
                     method: 'POST',
@@ -161,11 +224,21 @@ document.addEventListener("DOMContentLoaded", () => {
             diffResult.classList.add('hidden');
 
             try {
+                localStorage.setItem('last_auto_segment_model', modelName);
+
                 const payload = {
                     dataset_name: window.DATASET_NAME,
                     image_path: window.IMAGE_URL,
                     model_name: modelName
                 };
+                
+                if (useDenoiseChk && useDenoiseChk.checked) {
+                    payload.use_denoise = true;
+                    payload.h_lum = parseFloat(dnHLum.value);
+                    payload.h_col = parseFloat(dnHCol.value);
+                    payload.tw = parseInt(dnTw.value, 10);
+                    payload.sw = parseInt(dnSw.value, 10);
+                }
 
                 const resp = await fetch(`/api/dataset/${window.DATASET_NAME}/auto_check_single`, {
                     method: 'POST',

@@ -270,6 +270,11 @@ class AutoSegmentRequest(BaseModel):
     dataset_name: str
     image_path: str
     model_name: str
+    use_denoise: bool = False
+    h_lum: float = 10.0
+    h_col: float = 10.0
+    tw: int = 7
+    sw: int = 21
 
 @app.post("/api/auto_segment")
 async def api_auto_segment(req: AutoSegmentRequest):
@@ -293,13 +298,27 @@ async def api_auto_segment(req: AutoSegmentRequest):
         # Dynamically import to avoid slowing down startup if inference isn't used
         from ultralytics import YOLO
         import tempfile
+        import cv2
+        import numpy as np
     except ImportError:
-        raise HTTPException(status_code=500, detail="ultralytics library is not installed.")
+        raise HTTPException(status_code=500, detail="ultralytics or cv2 library is not installed.")
 
     model = YOLO(str(model_path))
     
     # Run prediction
-    results = model.predict(source=str(physical_img_path), save=False, conf=0.25)
+    if getattr(req, 'use_denoise', False):
+        # Apply OpenCV Denoising
+        img_bgr = cv2.imread(str(physical_img_path))
+        if img_bgr is None:
+            raise HTTPException(status_code=500, detail="Failed to read image for denoising.")
+        
+        # dst = fastNlMeansDenoisingColored(src, dst, h, hColor, templateWindowSize, searchWindowSize)
+        denoised_img = cv2.fastNlMeansDenoisingColored(
+            img_bgr, None, float(req.h_lum), float(req.h_col), int(req.tw), int(req.sw)
+        )
+        results = model.predict(source=denoised_img, save=False, conf=0.25)
+    else:
+        results = model.predict(source=str(physical_img_path), save=False, conf=0.25)
     
     result = results[0]
     
@@ -411,6 +430,11 @@ async def api_auto_check(dataset_name: str, req: AutoCheckRequest):
 class AutoCheckSingleRequest(BaseModel):
     model_name: str
     image_path: str
+    use_denoise: bool = False
+    h_lum: float = 10.0
+    h_col: float = 10.0
+    tw: int = 7
+    sw: int = 21
     
 @app.post("/api/dataset/{dataset_name}/auto_check_single")
 async def api_auto_check_single(dataset_name: str, req: AutoCheckSingleRequest):
@@ -435,7 +459,18 @@ async def api_auto_check_single(dataset_name: str, req: AutoCheckSingleRequest):
     
     lbl_file = physical_img_path.parent.parent / "labels" / (physical_img_path.stem + ".txt")
     
-    results = model.predict(source=str(physical_img_path), save=False, conf=0.25, verbose=False)
+    if getattr(req, 'use_denoise', False):
+        img_bgr = cv2.imread(str(physical_img_path))
+        if img_bgr is not None:
+            denoised_img = cv2.fastNlMeansDenoisingColored(
+                img_bgr, None, float(req.h_lum), float(req.h_col), int(req.tw), int(req.sw)
+            )
+            results = model.predict(source=denoised_img, save=False, conf=0.25, verbose=False)
+        else:
+            results = model.predict(source=str(physical_img_path), save=False, conf=0.25, verbose=False)
+    else:
+        results = model.predict(source=str(physical_img_path), save=False, conf=0.25, verbose=False)
+        
     res = results[0]
     
     H, W = 640, 640
