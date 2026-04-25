@@ -1,18 +1,21 @@
 # YOLO Segmentation Dataset Maker
 
-A web application built with FastAPI and HTMX for creating, managing, and editing YOLO segmentation datasets.
+A FastAPI web application for creating, managing, and editing YOLO segmentation datasets.
 
 ## Features
 
 - **Dataset Management:** View and create YOLO segmentation datasets (using `data.yaml`).
-- **Image Upload:** Upload images directly to train/valid/test splits via the dashboard.
+- **Image Upload:** Drag/drop or pick images from the dashboard. Files are saved into `train/images/` and renamed to `{sha1[:16]}.{ext}` on save; identical-content uploads are skipped automatically.
 - **Auto-Split:** Randomly shuffle and distribute images and their labels into train/valid/test splits.
+- **Move Between Splits:** Change a single image's split (with its label) directly from the gallery.
+- **Filename Normalization & Dedupe:** Press **Reload** on the dataset page to rename every image and its label to `{sha1[:16]}.{ext}`, drop any content duplicates (within or across splits), clean up orphan label files (label without an image), and update `auto_check.json` keys accordingly. ASCII-only filenames keep the dataset portable across filesystems and training environments.
 - **Image Editor:**
   - Polygon drawing tool for segmentation.
   - Interactive manipulation (drag points, undo/redo, zoom/pan).
   - Class management (add, rename, merge, delete classes).
   - Delete unwanted images directly from the editor.
-- **Auto-Segmentation:** Use pre-trained YOLO models residing in the `models/` directory to automatically predict segmentation masks and convert them to editable polygons in the browser.
+- **Auto-Segmentation:** Use pre-trained YOLO models residing in the `models/` directory to predict segmentation masks and convert them to editable polygons in the browser. Optional OpenCV denoising can be applied before inference.
+- **Auto-Check:** Run a model across the dataset and score every image by `1 - IoU(GT, Pred)`. Scores are persisted in `auto_check.json` and can be used in the gallery as a sort key (highest-diff first) to surface labels worth reviewing.
 
 ## Directory Structure
 
