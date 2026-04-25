@@ -7,7 +7,19 @@ import yaml
 import shutil
 import random
 import json
+import hashlib
+import re
 from pathlib import Path
+
+HASH_STEM_PATTERN = re.compile(r"^[0-9a-f]{16}$")
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+def compute_image_hash(path: Path) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
 from config import DATASETS_DIR, BASE_DIR, MODELS_DIR
 
 app = FastAPI(title="YOLO Segmentation Dataset Editor")
@@ -640,39 +652,146 @@ from fastapi import UploadFile, File
 
 @app.post("/api/dataset/{dataset_name}/upload_images")
 async def api_upload_images(dataset_name: str, files: List[UploadFile] = File(...)):
+    # Track existing hash-stems across all splits (assumes filenames are already
+    # normalized to hash form; if not, normalize_filenames will dedupe later).
     existing_stems = set()
     for split in ["train", "valid", "test", "val"]:
         split_dir = DATASETS_DIR / dataset_name / split / "images"
         if split_dir.exists():
             for img_file in split_dir.glob("*.*"):
-                existing_stems.add(img_file.stem)
-                
+                if img_file.suffix.lower() in IMAGE_EXTS:
+                    existing_stems.add(img_file.stem)
+
     target_dir = DATASETS_DIR / dataset_name / "train" / "images"
     target_dir.mkdir(parents=True, exist_ok=True)
-    
+
     saved_files = []
+    skipped = 0
     for file in files:
-        if file.filename:
-            original_path = Path(file.filename)
-            stem = original_path.stem
-            suffix = original_path.suffix
-            
-            new_stem = stem
-            counter = 1
-            while new_stem in existing_stems:
-                new_stem = f"{stem}_{counter}"
-                counter += 1
-                
-            existing_stems.add(new_stem)
-            new_filename = f"{new_stem}{suffix}"
-            file_path = target_dir / new_filename
-            
-            with open(file_path, "wb") as f:
-                content = await file.read()
-                f.write(content)
-            saved_files.append(new_filename)
-            
-    return {"status": "ok", "uploaded": len(saved_files)}
+        if not file.filename:
+            continue
+        suffix = Path(file.filename).suffix.lower()
+        if suffix not in IMAGE_EXTS:
+            continue
+
+        content = await file.read()
+        hash_stem = hashlib.sha1(content).hexdigest()[:16]
+
+        if hash_stem in existing_stems:
+            skipped += 1
+            continue
+
+        new_filename = f"{hash_stem}{suffix}"
+        file_path = target_dir / new_filename
+        with open(file_path, "wb") as f:
+            f.write(content)
+        existing_stems.add(hash_stem)
+        saved_files.append(new_filename)
+
+    return {"status": "ok", "uploaded": len(saved_files), "skipped": skipped}
+
+@app.post("/api/dataset/{dataset_name}/normalize_filenames")
+async def api_normalize_filenames(dataset_name: str):
+    if not (DATASETS_DIR / dataset_name).exists():
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    seen_hashes = {}     # hash_stem -> final Path of the kept image
+    rename_map = {}      # old image filename -> new image filename
+    renamed = 0
+    deleted_dup = 0
+    deleted_orphan = 0
+
+    # Phase 1: rename images (and labels) to {hash}.{ext}; drop content duplicates.
+    for split in ["train", "valid", "test", "val"]:
+        images_dir = DATASETS_DIR / dataset_name / split / "images"
+        labels_dir = DATASETS_DIR / dataset_name / split / "labels"
+        if not images_dir.exists():
+            continue
+
+        for img_file in list(images_dir.glob("*.*")):
+            if img_file.suffix.lower() not in IMAGE_EXTS:
+                continue
+
+            old_name = img_file.name
+
+            # Trust hash-pattern filenames to avoid re-hashing on every reload.
+            if HASH_STEM_PATTERN.match(img_file.stem):
+                hash_stem = img_file.stem
+            else:
+                hash_stem = compute_image_hash(img_file)
+
+            new_suffix = img_file.suffix.lower()
+            old_label = labels_dir / f"{img_file.stem}.txt"
+
+            if hash_stem in seen_hashes:
+                img_file.unlink()
+                if old_label.exists():
+                    old_label.unlink()
+                deleted_dup += 1
+                continue
+
+            new_img_path = images_dir / f"{hash_stem}{new_suffix}"
+            new_label = labels_dir / f"{hash_stem}.txt"
+
+            if new_img_path != img_file:
+                if new_img_path.exists():
+                    img_file.unlink()
+                    if old_label.exists():
+                        old_label.unlink()
+                    deleted_dup += 1
+                    continue
+                img_file.rename(new_img_path)
+                if old_label.exists():
+                    if new_label.exists():
+                        old_label.unlink()
+                    else:
+                        old_label.rename(new_label)
+                rename_map[old_name] = new_img_path.name
+                renamed += 1
+
+            seen_hashes[hash_stem] = new_img_path
+
+    # Phase 2: drop label files whose image no longer exists.
+    for split in ["train", "valid", "test", "val"]:
+        images_dir = DATASETS_DIR / dataset_name / split / "images"
+        labels_dir = DATASETS_DIR / dataset_name / split / "labels"
+        if not labels_dir.exists():
+            continue
+
+        image_stems = set()
+        if images_dir.exists():
+            for img_file in images_dir.glob("*.*"):
+                if img_file.suffix.lower() in IMAGE_EXTS:
+                    image_stems.add(img_file.stem)
+
+        for lbl_file in list(labels_dir.glob("*.txt")):
+            if lbl_file.stem not in image_stems:
+                lbl_file.unlink()
+                deleted_orphan += 1
+
+    # Update auto_check.json keys to follow renames; drop entries for removed images.
+    scores_file = DATASETS_DIR / dataset_name / "auto_check.json"
+    if scores_file.exists():
+        try:
+            with open(scores_file, "r") as f:
+                scores = json.load(f)
+            current_image_names = {p.name for p in seen_hashes.values()}
+            new_scores = {}
+            for k, v in scores.items():
+                new_k = rename_map.get(k, k)
+                if new_k in current_image_names:
+                    new_scores[new_k] = v
+            with open(scores_file, "w") as f:
+                json.dump(new_scores, f)
+        except Exception:
+            pass
+
+    return {
+        "status": "ok",
+        "renamed": renamed,
+        "deleted_duplicates": deleted_dup,
+        "deleted_orphans": deleted_orphan,
+    }
 
 class DeleteImageRequest(BaseModel):
     image_path: str
