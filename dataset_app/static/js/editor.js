@@ -4,6 +4,12 @@ document.addEventListener("DOMContentLoaded", () => {
     const container = document.getElementById('editor-container');
     const sourceImage = document.getElementById('source-image');
 
+    // Render the canvas backing buffer at this multiple of the image's natural
+    // size so CSS-zoom can stretch up to `RESOLUTION_MULTIPLIER`x before pixels
+    // are interpolated by the browser. The canvas's CSS size still tracks the
+    // image's natural size, so visual layout is unchanged at scale=1.
+    const RESOLUTION_MULTIPLIER = 2;
+
     // State
     let polygons = []; // Array of { classId, points: [{x, y}] }
     let currentPolygon = null;
@@ -448,11 +454,8 @@ document.addEventListener("DOMContentLoaded", () => {
     function fitImageToContainer() {
         const containerRect = container.getBoundingClientRect();
 
-        // Reset scale and offsets
+        // Reset scale and offsets. Canvas dimensions are managed inside draw().
         scale = 1;
-
-        canvas.width = sourceImage.width;
-        canvas.height = sourceImage.height;
 
         // Calculate initial zoom to fit container while preserving aspect ratio
         const scaleX = containerRect.width / sourceImage.width;
@@ -669,12 +672,13 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     });
 
-    // Coordinate Conversion
+    // Coordinate Conversion (returns coordinates in image-pixel space, which is
+    // also the polygon coordinate space; independent of RESOLUTION_MULTIPLIER).
     function getMousePos(evt) {
         const rect = canvas.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0) return { x: 0, y: 0 };
-        const x = (evt.clientX - rect.left) / rect.width * canvas.width;
-        const y = (evt.clientY - rect.top) / rect.height * canvas.height;
+        const x = (evt.clientX - rect.left) / rect.width * sourceImage.width;
+        const y = (evt.clientY - rect.top) / rect.height * sourceImage.height;
         return { x, y };
     }
 
@@ -685,8 +689,8 @@ document.addEventListener("DOMContentLoaded", () => {
         const cvsRect = canvas.getBoundingClientRect();
         if (cvsRect.width === 0) return;
 
-        const ptX = (e.clientX - cvsRect.left) / cvsRect.width * canvas.width;
-        const ptY = (e.clientY - cvsRect.top) / cvsRect.height * canvas.height;
+        const ptX = (e.clientX - cvsRect.left) / cvsRect.width * sourceImage.width;
+        const ptY = (e.clientY - cvsRect.top) / cvsRect.height * sourceImage.height;
 
         const zoomIntensity = 0.1;
         const wheel = e.deltaY < 0 ? 1 : -1;
@@ -892,27 +896,33 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // Drawing
     function draw(mousePos = null) {
-        // Only adjust canvas width/height if it changed
-        if (canvas.width !== sourceImage.width || canvas.height !== sourceImage.height) {
-            canvas.width = sourceImage.width;
-            canvas.height = sourceImage.height;
+        const imgW = sourceImage.width;
+        const imgH = sourceImage.height;
+        const internalW = imgW * RESOLUTION_MULTIPLIER;
+        const internalH = imgH * RESOLUTION_MULTIPLIER;
+
+        // Backing buffer is RESOLUTION_MULTIPLIER times the image's natural size;
+        // CSS size still matches natural size so layout/transform math is unchanged.
+        if (canvas.width !== internalW || canvas.height !== internalH) {
+            canvas.width = internalW;
+            canvas.height = internalH;
         }
 
-        // Instead of forcing 100% width/height (which breaks aspect ratio),
-        // we set explicit pixel sizes matching the logical width/height to CSS width/height
-        // and then let the CSS transform scale and position it.
-        canvas.style.width = sourceImage.width + 'px';
-        canvas.style.height = sourceImage.height + 'px';
+        canvas.style.width = imgW + 'px';
+        canvas.style.height = imgH + 'px';
         canvas.style.position = 'absolute';
         canvas.style.left = '0';
         canvas.style.top = '0';
-
-        // Actual internal resolution matches the image
-        // Then we use CSS transforms to position it
         canvas.style.transformOrigin = '0 0';
         canvas.style.transform = `translate(${offsetX}px, ${offsetY}px) scale(${scale})`;
 
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        // Map drawing coordinates back to image-pixel space so polygon math and
+        // line widths stay identical to the non-supersampled implementation.
+        ctx.setTransform(RESOLUTION_MULTIPLIER, 0, 0, RESOLUTION_MULTIPLIER, 0, 0);
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+
+        ctx.clearRect(0, 0, imgW, imgH);
 
         // Draw source image
         ctx.globalAlpha = 1.0;
