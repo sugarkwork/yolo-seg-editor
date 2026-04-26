@@ -175,6 +175,56 @@
                         </button>
                     </div>
                 </div>
+
+                <div class="mt-4 border-t border-slate-700 pt-4 cursor-default">
+                    <h3 class="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">Model Benchmark</h3>
+                    <p class="text-[10px] text-slate-500 mb-2 leading-tight">Pick models to compare. Mean IoU vs ground-truth labels per image.</p>
+                    <div class="flex flex-col gap-2">
+                        <div id="benchmark-model-list"
+                            class="max-h-40 overflow-y-auto bg-slate-900 border border-slate-700 rounded p-2 text-xs space-y-1 custom-scrollbar">
+                            <p class="text-slate-500 italic">Loading models...</p>
+                        </div>
+                        <div class="flex gap-2 items-center">
+                            <button onclick="benchmarkSelectAll(true)"
+                                class="flex-1 text-[10px] text-slate-400 hover:text-indigo-300 transition-colors">Select all</button>
+                            <button onclick="benchmarkSelectAll(false)"
+                                class="flex-1 text-[10px] text-slate-400 hover:text-indigo-300 transition-colors">Clear</button>
+                        </div>
+                        <select id="benchmark-split"
+                            class="w-full bg-slate-900 border border-slate-700 rounded px-2 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500">
+                            <option value="test">Test split</option>
+                            <option value="valid">Valid split</option>
+                            <option value="train">Train split</option>
+                            <option value="all">All splits</option>
+                        </select>
+                        <button id="benchmark-run-btn" onclick="submitBenchmark()"
+                            class="w-full bg-cyan-600 hover:bg-cyan-500 disabled:opacity-60 text-white font-medium py-2 px-4 rounded transition-colors flex justify-center items-center gap-2">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24"
+                                stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M13 10V3L4 14h7v7l9-11h-7z" />
+                            </svg>
+                            <span id="benchmark-run-btn-text">Run Benchmark</span>
+                        </button>
+                        <div id="benchmark-results" class="hidden mt-2">
+                            <div class="flex justify-between items-baseline mb-1">
+                                <h4 class="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Ranking</h4>
+                                <span id="benchmark-meta" class="text-[10px] text-slate-500"></span>
+                            </div>
+                            <table class="w-full text-xs">
+                                <thead>
+                                    <tr class="text-slate-400 border-b border-slate-700">
+                                        <th class="text-left py-1 font-medium">#</th>
+                                        <th class="text-left py-1 font-medium">Model</th>
+                                        <th class="text-right py-1 font-medium">mIoU</th>
+                                        <th class="text-right py-1 font-medium">Time</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="benchmark-results-tbody"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -381,9 +431,111 @@
                     opt.textContent = m;
                     sel.appendChild(opt);
                 });
+                populateBenchmarkModels(data.models);
             }
         } catch (e) { console.error("Could not load models", e); }
+
+        loadSavedBenchmark();
     });
+
+    function populateBenchmarkModels(models) {
+        const container = document.getElementById('benchmark-model-list');
+        container.innerHTML = '';
+        if (!models || models.length === 0) {
+            container.innerHTML = '<p class="text-slate-500 italic">No models in models/</p>';
+            return;
+        }
+        models.forEach(m => {
+            const id = `bench-model-${btoa(m).replace(/=/g, '')}`;
+            const lbl = document.createElement('label');
+            lbl.className = 'flex items-center gap-2 cursor-pointer hover:text-white text-slate-300';
+            lbl.innerHTML = `
+                <input type="checkbox" id="${id}" value="${m}" class="bench-model w-3 h-3 rounded bg-slate-800 border-slate-600 text-cyan-500 focus:ring-cyan-500">
+                <span class="truncate" title="${m}">${m}</span>
+            `;
+            container.appendChild(lbl);
+        });
+    }
+
+    function benchmarkSelectAll(state) {
+        document.querySelectorAll('.bench-model').forEach(c => { c.checked = state; });
+    }
+
+    async function loadSavedBenchmark() {
+        try {
+            const resp = await fetch(`/api/dataset/${datasetName}/benchmark_result`);
+            if (!resp.ok) return;
+            const data = await resp.json();
+            if (data && data.status === 'ok') {
+                renderBenchmarkResults(data);
+            }
+        } catch (e) { /* ignore */ }
+    }
+
+    async function submitBenchmark() {
+        const selected = Array.from(document.querySelectorAll('.bench-model:checked')).map(c => c.value);
+        if (selected.length === 0) {
+            alert('Select at least one model.');
+            return;
+        }
+        const split = document.getElementById('benchmark-split').value;
+        const btn = document.getElementById('benchmark-run-btn');
+        const btnText = document.getElementById('benchmark-run-btn-text');
+        const origText = btnText.textContent;
+        btn.disabled = true;
+        btnText.textContent = `Running ${selected.length} model${selected.length > 1 ? 's' : ''}...`;
+
+        try {
+            const resp = await fetch(`/api/dataset/${datasetName}/benchmark`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model_names: selected, split: split })
+            });
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                alert(err.detail || 'Benchmark failed');
+                return;
+            }
+            const data = await resp.json();
+            renderBenchmarkResults(data);
+        } catch (e) {
+            console.error(e);
+            alert('Network error during benchmark.');
+        } finally {
+            btn.disabled = false;
+            btnText.textContent = origText;
+        }
+    }
+
+    function renderBenchmarkResults(data) {
+        const wrap = document.getElementById('benchmark-results');
+        const tbody = document.getElementById('benchmark-results-tbody');
+        const meta = document.getElementById('benchmark-meta');
+        tbody.innerHTML = '';
+
+        const splitLabel = data.split === 'all' ? 'all splits' : `${data.split} split`;
+        const ranAt = data.ran_at ? ` · ${data.ran_at}` : '';
+        meta.textContent = `${data.image_count} img · ${splitLabel} · ${data.device || 'cpu'}${ranAt}`;
+
+        data.results.forEach((r, i) => {
+            const tr = document.createElement('tr');
+            tr.className = 'border-b border-slate-800/50';
+            const rankClass = r.error
+                ? 'text-rose-400'
+                : (i === 0 ? 'text-emerald-400 font-bold' : (i === 1 ? 'text-amber-300' : 'text-slate-300'));
+            const iouCell = r.error ? '—' : `${(r.mean_iou * 100).toFixed(1)}%`;
+            const errMark = r.error ? `<span title="${r.error.replace(/"/g, '&quot;')}" class="text-rose-400 ml-1">⚠</span>` : '';
+            tr.innerHTML = `
+                <td class="py-1 ${rankClass}">${i + 1}</td>
+                <td class="py-1 truncate max-w-[8rem] ${rankClass}" title="${r.model}">${r.model}${errMark}</td>
+                <td class="py-1 text-right ${rankClass}">${iouCell}</td>
+                <td class="py-1 text-right text-slate-500">${r.elapsed_sec.toFixed(1)}s</td>
+            `;
+            tbody.appendChild(tr);
+        });
+
+        wrap.classList.remove('hidden');
+    }
 
     async function apiCall(data) {
         data.dataset_name = datasetName;

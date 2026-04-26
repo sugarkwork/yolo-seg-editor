@@ -521,8 +521,170 @@ async def api_auto_check_single(dataset_name: str, req: AutoCheckSingleRequest):
     scores[physical_img_path.name] = diff
     with open(scores_file, "w") as f:
         json.dump(scores, f)
-        
+
     return {"status": "ok", "diff_score": diff, "image": physical_img_path.name}
+
+class BenchmarkRequest(BaseModel):
+    model_names: List[str]
+    split: str = "test"  # "train" | "valid" | "test" | "val" | "all"
+
+@app.post("/api/dataset/{dataset_name}/benchmark")
+async def api_benchmark(dataset_name: str, req: BenchmarkRequest):
+    if not req.model_names:
+        raise HTTPException(status_code=400, detail="No models specified")
+
+    valid_splits = {"train", "valid", "test", "val", "all"}
+    if req.split not in valid_splits:
+        raise HTTPException(status_code=400, detail=f"Invalid split: {req.split}")
+
+    splits = ["train", "valid", "test", "val"] if req.split == "all" else [req.split]
+
+    try:
+        from ultralytics import YOLO
+        import numpy as np
+        import cv2
+        import torch
+        import time
+    except ImportError as e:
+        raise HTTPException(status_code=500, detail=f"Missing required libraries: {e}")
+
+    # Collect images and corresponding label paths from the requested split(s).
+    image_paths = []
+    label_paths = []
+    for split in splits:
+        images_dir = DATASETS_DIR / dataset_name / split / "images"
+        labels_dir = DATASETS_DIR / dataset_name / split / "labels"
+        if not images_dir.exists():
+            continue
+        for img_file in sorted(images_dir.glob("*.*")):
+            if img_file.suffix.lower() in IMAGE_EXTS:
+                image_paths.append(img_file)
+                label_paths.append(labels_dir / f"{img_file.stem}.txt")
+
+    if not image_paths:
+        raise HTTPException(status_code=404, detail=f"No images found in split: {req.split}")
+
+    H, W = 640, 640
+
+    # Pre-rasterize ground-truth masks once; they don't depend on the model.
+    gt_masks = []
+    for lbl_file in label_paths:
+        gt_mask = np.zeros((H, W), dtype=np.uint8)
+        if lbl_file.exists():
+            with open(lbl_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 7 and len(parts) % 2 == 1:
+                        coords = [float(x) for x in parts[1:]]
+                        pts = np.array(
+                            [[int(coords[i] * W), int(coords[i + 1] * H)] for i in range(0, len(coords), 2)],
+                            dtype=np.int32,
+                        )
+                        cv2.fillPoly(gt_mask, [pts], 1)
+        gt_masks.append(gt_mask)
+
+    use_cuda = torch.cuda.is_available()
+    device = 0 if use_cuda else "cpu"
+    paths_str = [str(p) for p in image_paths]
+
+    results = []
+    for model_name in req.model_names:
+        model_path = MODELS_DIR / model_name
+        if not model_path.exists():
+            results.append({
+                "model": model_name,
+                "error": "Model file not found",
+                "mean_iou": 0.0,
+                "median_iou": 0.0,
+                "image_count": 0,
+                "elapsed_sec": 0.0,
+            })
+            continue
+
+        ious = []
+        t0 = time.time()
+        model = None
+        try:
+            model = YOLO(str(model_path))
+            stream = model.predict(
+                source=paths_str,
+                save=False,
+                conf=0.25,
+                verbose=False,
+                retina_masks=True,
+                device=device,
+                half=use_cuda,
+                stream=True,
+            )
+            for idx, res in enumerate(stream):
+                pred_mask = np.zeros((H, W), dtype=np.uint8)
+                if res.masks is not None:
+                    for mask_xyn in res.masks.xyn:
+                        pts = np.array(
+                            [[int(x * W), int(y * H)] for x, y in mask_xyn],
+                            dtype=np.int32,
+                        )
+                        cv2.fillPoly(pred_mask, [pts], 1)
+
+                gt_mask = gt_masks[idx]
+                inter = int(np.logical_and(gt_mask, pred_mask).sum())
+                union = int(np.logical_or(gt_mask, pred_mask).sum())
+                iou = 1.0 if union == 0 else inter / union
+                ious.append(float(iou))
+        except Exception as e:
+            results.append({
+                "model": model_name,
+                "error": str(e),
+                "mean_iou": float(np.mean(ious)) if ious else 0.0,
+                "median_iou": float(np.median(ious)) if ious else 0.0,
+                "image_count": len(ious),
+                "elapsed_sec": round(time.time() - t0, 2),
+            })
+            continue
+        finally:
+            del model
+            if use_cuda:
+                torch.cuda.empty_cache()
+
+        elapsed = time.time() - t0
+        results.append({
+            "model": model_name,
+            "mean_iou": round(float(np.mean(ious)), 4) if ious else 0.0,
+            "median_iou": round(float(np.median(ious)), 4) if ious else 0.0,
+            "image_count": len(ious),
+            "elapsed_sec": round(elapsed, 2),
+        })
+
+    results.sort(key=lambda r: r.get("mean_iou", 0.0), reverse=True)
+
+    payload = {
+        "status": "ok",
+        "split": req.split,
+        "image_count": len(image_paths),
+        "device": "cuda" if use_cuda else "cpu",
+        "ran_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "results": results,
+    }
+
+    bench_file = DATASETS_DIR / dataset_name / "benchmark.json"
+    try:
+        with open(bench_file, "w") as f:
+            json.dump(payload, f)
+    except Exception:
+        pass
+
+    return payload
+
+@app.get("/api/dataset/{dataset_name}/benchmark_result")
+async def api_benchmark_result(dataset_name: str):
+    bench_file = DATASETS_DIR / dataset_name / "benchmark.json"
+    if not bench_file.exists():
+        return {"status": "none"}
+    try:
+        with open(bench_file, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {"status": "none"}
 
 class AutoSplitRequest(BaseModel):
     train_ratio: float = 0.8
