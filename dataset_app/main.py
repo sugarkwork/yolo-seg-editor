@@ -14,6 +14,13 @@ from pathlib import Path
 HASH_STEM_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
+# Splits that participate in training. "pending" is a holding area for
+# unlabeled images and is intentionally excluded from auto-split, benchmark,
+# and the gallery's "All Splits" view.
+TRAINING_SPLITS = ["train", "valid", "test", "val"]
+PENDING_SPLIT = "pending"
+ALL_SPLITS = TRAINING_SPLITS + [PENDING_SPLIT]
+
 def compute_image_hash(path: Path) -> str:
     h = hashlib.sha1()
     with open(path, "rb") as f:
@@ -35,6 +42,123 @@ templates = Jinja2Templates(directory="templates")
 
 def get_yaml_path(dataset_name: str) -> Path:
     return DATASETS_DIR / dataset_name / "data.yaml"
+
+EDGE_PROXIMITY_THRESHOLD = 0.02
+
+def _polygon_edge_score(coords, threshold: float = EDGE_PROXIMITY_THRESHOLD) -> float:
+    """Score how 'almost-off-screen' a polygon is.
+
+    1.0 means a vertex sits just inside the frame and the polygon never
+    actually touches the edge — suspicious, the user likely forgot to drag
+    that point past the boundary. 0.0 means either every vertex is well
+    inside, or some vertex already reaches/exceeds the edge.
+    """
+    min_d_inside = 1.0
+    for i in range(0, len(coords), 2):
+        try:
+            x = float(coords[i])
+            y = float(coords[i + 1])
+        except (ValueError, IndexError):
+            continue
+        if x <= 0.0 or x >= 1.0 or y <= 0.0 or y >= 1.0:
+            return 0.0
+        d = min(x, 1.0 - x, y, 1.0 - y)
+        if d < min_d_inside:
+            min_d_inside = d
+    if min_d_inside >= threshold:
+        return 0.0
+    return round(1.0 - (min_d_inside / threshold), 4)
+
+def _compute_label_polygon_stats(label_path: Path):
+    total = 0
+    point_counts = []
+    edge_scores = []
+    if label_path.exists():
+        with open(label_path, "r", encoding="utf-8") as lf:
+            for line in lf:
+                parts = line.strip().split()
+                if len(parts) >= 7 and len(parts) % 2 == 1:
+                    total += 1
+                    point_counts.append((len(parts) - 1) // 2)
+                    edge_scores.append(_polygon_edge_score(parts[1:]))
+    return {
+        "total_polygons": total,
+        "max_polygon_points": max(point_counts) if point_counts else 0,
+        "min_polygon_points": min(point_counts) if point_counts else 0,
+        "edge_score": max(edge_scores) if edge_scores else 0.0,
+    }
+
+META_SCHEMA_VERSION = 2
+
+def get_image_meta(dataset_name: str, force_rebuild: bool = False) -> dict:
+    """Return per-image metadata (created/modified/polygon stats).
+
+    Cached in image_meta.json keyed by image filename. Entries are
+    invalidated when image or label mtime changes, so we never re-read a
+    label file that hasn't moved since last scan.
+    """
+    meta_file = DATASETS_DIR / dataset_name / "image_meta.json"
+    meta = {}
+    if meta_file.exists() and not force_rebuild:
+        try:
+            with open(meta_file, "r") as f:
+                meta = json.load(f)
+        except Exception:
+            meta = {}
+
+    updated = False
+    current_keys = set()
+
+    for split in ALL_SPLITS:
+        images_dir = DATASETS_DIR / dataset_name / split / "images"
+        labels_dir = DATASETS_DIR / dataset_name / split / "labels"
+        if not images_dir.exists():
+            continue
+        for img_file in images_dir.glob("*.*"):
+            if img_file.suffix.lower() not in IMAGE_EXTS:
+                continue
+            current_keys.add(img_file.name)
+
+            img_stat = img_file.stat()
+            img_mtime = img_stat.st_mtime
+
+            lbl_file = labels_dir / (img_file.stem + ".txt")
+            lbl_mtime = lbl_file.stat().st_mtime if lbl_file.exists() else 0.0
+
+            existing = meta.get(img_file.name)
+            if (not force_rebuild
+                    and existing
+                    and existing.get("v") == META_SCHEMA_VERSION
+                    and existing.get("img_mtime") == img_mtime
+                    and existing.get("lbl_mtime") == lbl_mtime):
+                continue
+
+            created = getattr(img_stat, "st_birthtime", img_stat.st_ctime)
+            poly_stats = _compute_label_polygon_stats(lbl_file)
+
+            meta[img_file.name] = {
+                "v": META_SCHEMA_VERSION,
+                "created": created,
+                "modified": img_mtime,
+                "img_mtime": img_mtime,
+                "lbl_mtime": lbl_mtime,
+                **poly_stats,
+            }
+            updated = True
+
+    stale = [k for k in meta if k not in current_keys]
+    for k in stale:
+        meta.pop(k)
+        updated = True
+
+    if updated:
+        try:
+            with open(meta_file, "w") as f:
+                json.dump(meta, f)
+        except Exception:
+            pass
+
+    return meta
 
 @app.get("/", response_class=HTMLResponse)
 async def read_dashboard(request: Request):
@@ -68,23 +192,25 @@ async def read_dataset(request: Request, dataset_name: str):
                 diff_scores = json.load(f)
         except Exception:
             pass
-            
+
+    image_meta = get_image_meta(dataset_name)
+
     # Let's find images (looking into train/images for now, or val/images, test/images)
     images = []
     stem_counts = {}
     all_img_files = []
-    for split in ["train", "valid", "test", "val"]:
+    for split in ALL_SPLITS:
         split_dir = DATASETS_DIR / dataset_name / split / "images"
         if split_dir.exists():
             for img_file in split_dir.glob("*.*"):
                 if img_file.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]:
                      stem_counts[img_file.stem] = stem_counts.get(img_file.stem, 0) + 1
                      all_img_files.append((split, img_file))
-                     
+
     for split, img_file in all_img_files:
         labels_dir = DATASETS_DIR / dataset_name / split / "labels"
         label_file = labels_dir / (img_file.stem + ".txt")
-        
+
         classes_present = set()
         if label_file.exists():
             with open(label_file, "r", encoding="utf-8") as lf:
@@ -95,7 +221,8 @@ async def read_dataset(request: Request, dataset_name: str):
                             classes_present.add(int(parts[0]))
                         except ValueError:
                             pass
-                            
+
+        m = image_meta.get(img_file.name, {})
         images.append({
             "name": img_file.name,
             "path": f"/datasets/{dataset_name}/{split}/images/{img_file.name}",
@@ -104,7 +231,13 @@ async def read_dataset(request: Request, dataset_name: str):
             "split": split,
             "classes_present": list(classes_present),
             "is_duplicate": stem_counts[img_file.stem] > 1,
-            "diff_score": diff_scores.get(img_file.name, 0.0)
+            "diff_score": diff_scores.get(img_file.name, 0.0),
+            "created": m.get("created", 0.0),
+            "modified": m.get("modified", 0.0),
+            "total_polygons": m.get("total_polygons", 0),
+            "max_polygon_points": m.get("max_polygon_points", 0),
+            "min_polygon_points": m.get("min_polygon_points", 0),
+            "edge_score": m.get("edge_score", 0.0),
         })
     
     return templates.TemplateResponse(
@@ -200,7 +333,7 @@ class ModifyClassRequest(BaseModel):
 def update_label_files(dataset_name: str, deleted_id: int, merge_target_id: int = -1):
     # If deleted_id matches, it becomes merge_target_id (if valid), else deleted.
     # Any ID > deleted_id decreases by 1.
-    for split in ["train", "valid", "test", "val"]:
+    for split in ALL_SPLITS:
         labels_dir = DATASETS_DIR / dataset_name / split / "labels"
         if not labels_dir.exists(): continue
         for txt_file in labels_dir.glob("*.txt"):
@@ -385,9 +518,9 @@ async def api_auto_check(dataset_name: str, req: AutoCheckRequest):
 
     model = YOLO(str(model_path))
     scores = {}
-    
-    # Check all images in dataset
-    for split in ["train", "valid", "test", "val"]:
+
+    # Check all images in dataset (pending images have no labels, so skip them)
+    for split in TRAINING_SPLITS:
         images_dir = DATASETS_DIR / dataset_name / split / "images"
         labels_dir = DATASETS_DIR / dataset_name / split / "labels"
         if not images_dir.exists(): continue
@@ -537,7 +670,7 @@ async def api_benchmark(dataset_name: str, req: BenchmarkRequest):
     if req.split not in valid_splits:
         raise HTTPException(status_code=400, detail=f"Invalid split: {req.split}")
 
-    splits = ["train", "valid", "test", "val"] if req.split == "all" else [req.split]
+    splits = list(TRAINING_SPLITS) if req.split == "all" else [req.split]
 
     try:
         from ultralytics import YOLO
@@ -699,8 +832,9 @@ async def api_auto_split(dataset_name: str, req: AutoSplitRequest):
         raise HTTPException(status_code=400, detail="Ratios must sum to 1.0")
         
     all_images = []
-    # Collect all existing images and labels
-    for split in ["train", "valid", "test", "val"]:
+    # Collect all existing images and labels. Pending images are intentionally
+    # excluded — they're unlabeled and the user is holding them out of training.
+    for split in TRAINING_SPLITS:
         split_dir = DATASETS_DIR / dataset_name / split / "images"
         if split_dir.exists():
             for img_file in split_dir.glob("*.*"):
@@ -746,7 +880,7 @@ class MoveImageRequest(BaseModel):
 
 @app.post("/api/dataset/{dataset_name}/move_image")
 async def api_move_image(dataset_name: str, req: MoveImageRequest):
-    if req.target_split not in ["train", "valid", "test", "val"]:
+    if req.target_split not in ALL_SPLITS:
         raise HTTPException(status_code=400, detail="Invalid target split")
         
     decoded_img_path = urllib.parse.unquote(req.image_path)
@@ -783,9 +917,47 @@ async def api_move_image(dataset_name: str, req: MoveImageRequest):
         shutil.move(str(label_path), str(new_lbl_path))
         
     return {
-        "status": "ok", 
+        "status": "ok",
         "new_image_path": f"/datasets/{dataset_name}/{req.target_split}/images/{physical_img_path.name}"
     }
+
+@app.post("/api/dataset/{dataset_name}/move_unlabeled_to_pending")
+async def api_move_unlabeled_to_pending(dataset_name: str):
+    """Bulk-move every unlabeled image in train/valid/test/val into pending.
+
+    Treats both "no label file" and "empty label file" as unlabeled. The empty
+    label is removed so it doesn't get re-read as a valid (but bogus) entry
+    after the move.
+    """
+    if not (DATASETS_DIR / dataset_name).exists():
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    dest_img_dir = DATASETS_DIR / dataset_name / PENDING_SPLIT / "images"
+    dest_img_dir.mkdir(parents=True, exist_ok=True)
+
+    moved = 0
+    for split in TRAINING_SPLITS:
+        images_dir = DATASETS_DIR / dataset_name / split / "images"
+        labels_dir = DATASETS_DIR / dataset_name / split / "labels"
+        if not images_dir.exists():
+            continue
+        for img_file in list(images_dir.glob("*.*")):
+            if img_file.suffix.lower() not in IMAGE_EXTS:
+                continue
+            lbl_file = labels_dir / (img_file.stem + ".txt")
+            if lbl_file.exists() and lbl_file.stat().st_size > 0:
+                continue
+            dest_path = dest_img_dir / img_file.name
+            if dest_path.exists():
+                # Same hash already in pending — drop the duplicate source.
+                img_file.unlink()
+            else:
+                shutil.move(str(img_file), str(dest_path))
+            if lbl_file.exists():
+                lbl_file.unlink()
+            moved += 1
+
+    return {"status": "ok", "moved": moved}
 
 class CreateDatasetRequest(BaseModel):
     dataset_name: str
@@ -800,7 +972,7 @@ async def api_create_dataset(req: CreateDatasetRequest):
         raise HTTPException(status_code=400, detail="Dataset already exists")
         
     # Scaffold directories
-    for split in ["train", "valid", "test"]:
+    for split in ["train", "valid", "test", PENDING_SPLIT]:
         (ds_dir / split / "images").mkdir(parents=True, exist_ok=True)
         (ds_dir / split / "labels").mkdir(parents=True, exist_ok=True)
         
@@ -817,14 +989,16 @@ async def api_upload_images(dataset_name: str, files: List[UploadFile] = File(..
     # Track existing hash-stems across all splits (assumes filenames are already
     # normalized to hash form; if not, normalize_filenames will dedupe later).
     existing_stems = set()
-    for split in ["train", "valid", "test", "val"]:
+    for split in ALL_SPLITS:
         split_dir = DATASETS_DIR / dataset_name / split / "images"
         if split_dir.exists():
             for img_file in split_dir.glob("*.*"):
                 if img_file.suffix.lower() in IMAGE_EXTS:
                     existing_stems.add(img_file.stem)
 
-    target_dir = DATASETS_DIR / dataset_name / "train" / "images"
+    # Newly uploaded images land in "pending" so they don't pollute training
+    # until the user has labeled them and moved them into train/valid/test.
+    target_dir = DATASETS_DIR / dataset_name / PENDING_SPLIT / "images"
     target_dir.mkdir(parents=True, exist_ok=True)
 
     saved_files = []
@@ -852,6 +1026,145 @@ async def api_upload_images(dataset_name: str, files: List[UploadFile] = File(..
 
     return {"status": "ok", "uploaded": len(saved_files), "skipped": skipped}
 
+def _clip_polygon_to_unit_square(points):
+    """Sutherland-Hodgman polygon clip against [0,1] x [0,1].
+
+    Each iteration clips against one half-plane (one image edge), inserting
+    new vertices at the intersections between in-segment and out-segment so
+    the polygon outline is preserved instead of being collapsed to corners.
+    Returns the clipped polygon (possibly empty if fully outside).
+    """
+    # (axis, boundary, inside_sign) — inside_sign=+1 means coord >= boundary
+    edges = [
+        ("x", 0.0, +1),  # left
+        ("x", 1.0, -1),  # right
+        ("y", 0.0, +1),  # top
+        ("y", 1.0, -1),  # bottom
+    ]
+
+    def is_inside(pt, axis, boundary, sign):
+        v = pt[0] if axis == "x" else pt[1]
+        return (v >= boundary) if sign > 0 else (v <= boundary)
+
+    def intersect(p1, p2, axis, boundary):
+        x1, y1 = p1
+        x2, y2 = p2
+        if axis == "x":
+            dx = x2 - x1
+            t = 0.0 if dx == 0 else (boundary - x1) / dx
+            return (boundary, y1 + t * (y2 - y1))
+        dy = y2 - y1
+        t = 0.0 if dy == 0 else (boundary - y1) / dy
+        return (x1 + t * (x2 - x1), boundary)
+
+    output = list(points)
+    for axis, boundary, sign in edges:
+        if not output:
+            return output
+        inp = output
+        output = []
+        s = inp[-1]
+        s_in = is_inside(s, axis, boundary, sign)
+        for e in inp:
+            e_in = is_inside(e, axis, boundary, sign)
+            if e_in:
+                if not s_in:
+                    output.append(intersect(s, e, axis, boundary))
+                output.append(e)
+            elif s_in:
+                output.append(intersect(s, e, axis, boundary))
+            s, s_in = e, e_in
+    return output
+
+
+def _clip_labels_in_dataset(dataset_name: str) -> dict:
+    files_modified = 0
+    polygons_clipped = 0
+    polygons_dropped = 0
+
+    for split in ALL_SPLITS:
+        labels_dir = DATASETS_DIR / dataset_name / split / "labels"
+        if not labels_dir.exists():
+            continue
+        for lbl_file in labels_dir.glob("*.txt"):
+            file_changed = False
+            new_lines = []
+            try:
+                with open(lbl_file, "r", encoding="utf-8") as fp:
+                    raw_lines = fp.readlines()
+            except Exception:
+                continue
+
+            for line in raw_lines:
+                parts = line.strip().split()
+                if len(parts) < 7 or len(parts) % 2 != 1:
+                    new_lines.append(line)
+                    continue
+                class_id = parts[0]
+                try:
+                    coords = [float(v) for v in parts[1:]]
+                except ValueError:
+                    new_lines.append(line)
+                    continue
+
+                pts = [(coords[i], coords[i + 1]) for i in range(0, len(coords), 2)]
+                has_oob = any(x < 0.0 or x > 1.0 or y < 0.0 or y > 1.0 for x, y in pts)
+                if not has_oob:
+                    new_lines.append(line)
+                    continue
+
+                clipped = _clip_polygon_to_unit_square(pts)
+                file_changed = True
+                if len(clipped) < 3:
+                    polygons_dropped += 1
+                    continue
+                polygons_clipped += 1
+                clipped_strs = " ".join(
+                    f"{max(0.0, min(1.0, c)):.6f}" for pt in clipped for c in pt
+                )
+                new_lines.append(f"{class_id} {clipped_strs}\n")
+
+            if file_changed:
+                with open(lbl_file, "w", encoding="utf-8") as fp:
+                    fp.writelines(new_lines)
+                files_modified += 1
+
+    return {
+        "files_modified": files_modified,
+        "polygons_clipped": polygons_clipped,
+        "polygons_dropped": polygons_dropped,
+    }
+
+
+@app.post("/api/dataset/{dataset_name}/clip_labels")
+async def api_clip_labels(dataset_name: str):
+    """Clip polygons against the image frame using Sutherland-Hodgman.
+
+    Out-of-frame vertices are not naively clamped (which would collapse the
+    polygon to image corners). Instead, intersections between an inside
+    vertex and an outside vertex are inserted at the boundary, and the
+    outside vertex is dropped. Polygons fully outside the frame are removed.
+    """
+    if not (DATASETS_DIR / dataset_name).exists():
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    return {"status": "ok", **_clip_labels_in_dataset(dataset_name)}
+
+
+@app.post("/api/clip_all_labels")
+async def api_clip_all_labels():
+    """Run polygon clipping across every dataset under DATASETS_DIR."""
+    per_dataset = []
+    totals = {"files_modified": 0, "polygons_clipped": 0, "polygons_dropped": 0}
+    if DATASETS_DIR.exists():
+        for item in sorted(DATASETS_DIR.iterdir()):
+            if not item.is_dir() or not (item / "data.yaml").exists():
+                continue
+            stats = _clip_labels_in_dataset(item.name)
+            per_dataset.append({"dataset": item.name, **stats})
+            for k in totals:
+                totals[k] += stats[k]
+    return {"status": "ok", "datasets": per_dataset, "totals": totals}
+
 @app.post("/api/dataset/{dataset_name}/normalize_filenames")
 async def api_normalize_filenames(dataset_name: str):
     if not (DATASETS_DIR / dataset_name).exists():
@@ -864,7 +1177,7 @@ async def api_normalize_filenames(dataset_name: str):
     deleted_orphan = 0
 
     # Phase 1: rename images (and labels) to {hash}.{ext}; drop content duplicates.
-    for split in ["train", "valid", "test", "val"]:
+    for split in ALL_SPLITS:
         images_dir = DATASETS_DIR / dataset_name / split / "images"
         labels_dir = DATASETS_DIR / dataset_name / split / "labels"
         if not images_dir.exists():
@@ -914,7 +1227,7 @@ async def api_normalize_filenames(dataset_name: str):
             seen_hashes[hash_stem] = new_img_path
 
     # Phase 2: drop label files whose image no longer exists.
-    for split in ["train", "valid", "test", "val"]:
+    for split in ALL_SPLITS:
         images_dir = DATASETS_DIR / dataset_name / split / "images"
         labels_dir = DATASETS_DIR / dataset_name / split / "labels"
         if not labels_dir.exists():
@@ -974,8 +1287,8 @@ async def api_delete_image(dataset_name: str, req: DeleteImageRequest):
              
         split = parts[2]
         filename = parts[4]
-        
-        if split not in ["train", "valid", "test", "val"]:
+
+        if split not in ALL_SPLITS:
             raise HTTPException(status_code=400, detail="Invalid split")
             
         img_file = DATASETS_DIR / dataset_name / split / "images" / filename
@@ -998,7 +1311,7 @@ async def api_delete_image(dataset_name: str, req: DeleteImageRequest):
 @app.get("/api/dataset/{dataset_name}/next_unlabeled")
 async def api_next_unlabeled(dataset_name: str):
     # Scan splits in order for an image without a label file
-    for split in ["train", "valid", "test", "val"]:
+    for split in ALL_SPLITS:
         images_dir = DATASETS_DIR / dataset_name / split / "images"
         labels_dir = DATASETS_DIR / dataset_name / split / "labels"
         if not images_dir.exists():
@@ -1019,7 +1332,7 @@ async def api_next_unlabeled(dataset_name: str):
 def get_all_images(dataset_name: str):
     images = []
     # Using the same order as in gallery (read_dataset)
-    for split in ["train", "valid", "test", "val"]:
+    for split in ALL_SPLITS:
         images_dir = DATASETS_DIR / dataset_name / split / "images"
         if not images_dir.exists():
             continue

@@ -8,6 +8,16 @@
             <p class="text-slate-400">Select a dataset to view or edit segmentation labels.</p>
         </div>
         <div class="flex gap-3">
+            <button id="clip-all-btn" onclick="submitClipAll()"
+                class="bg-slate-700 hover:bg-slate-600 disabled:opacity-60 text-white px-4 py-2 font-medium rounded-lg transition-colors flex items-center gap-2 shadow-lg shadow-slate-900/20 border border-slate-600"
+                title="Sutherland-Hodgman polygon clipping across every dataset under datasets/">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24"
+                    stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                        d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                </svg>
+                <span id="clip-all-btn-text">Clip All Datasets</span>
+            </button>
             <button onclick="window.location.reload()"
                 class="bg-slate-700 hover:bg-slate-600 text-white px-4 py-2 font-medium rounded-lg transition-colors flex items-center gap-2 shadow-lg shadow-slate-900/20">
                 <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24"
@@ -129,5 +139,43 @@
     document.getElementById('new-dataset-name').addEventListener('keyup', function (e) {
         if (e.key === 'Enter') submitNewDataset();
     });
+
+    async function submitClipAll() {
+        if (!confirm("Run polygon clipping across ALL datasets?\n\nFor every label file in every dataset, polygons that cross the image boundary will have intersection vertices inserted and outside vertices dropped. Polygons fully outside the frame will be removed.")) {
+            return;
+        }
+        const btn = document.getElementById('clip-all-btn');
+        const txt = document.getElementById('clip-all-btn-text');
+        const orig = txt.textContent;
+        btn.disabled = true;
+        txt.textContent = 'Clipping...';
+        try {
+            const resp = await fetch('/api/clip_all_labels', { method: 'POST' });
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                alert(err.detail || 'Error during bulk clip');
+                return;
+            }
+            const data = await resp.json();
+            const t = data.totals;
+            const lines = [
+                `Done across ${data.datasets.length} dataset(s).`,
+                `Total files modified: ${t.files_modified}`,
+                `Total polygons clipped: ${t.polygons_clipped}`,
+                `Total polygons dropped (fully outside): ${t.polygons_dropped}`,
+                '',
+                'Per dataset:',
+                ...data.datasets
+                    .filter(d => d.files_modified > 0 || d.polygons_clipped > 0 || d.polygons_dropped > 0)
+                    .map(d => `  ${d.dataset}: ${d.files_modified} file(s), ${d.polygons_clipped} clipped, ${d.polygons_dropped} dropped`)
+            ];
+            alert(lines.join('\n'));
+        } catch (e) {
+            alert('Network error');
+        } finally {
+            btn.disabled = false;
+            txt.textContent = orig;
+        }
+    }
 </script>
 {% endblock %}

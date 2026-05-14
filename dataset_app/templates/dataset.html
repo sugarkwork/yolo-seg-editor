@@ -129,14 +129,25 @@
         <!-- Dataset Stats -->
         <div class="glass-panel p-6">
             <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-4">Distribution & Split</h3>
-            <div class="flex justify-between items-center bg-slate-800/50 rounded-lg p-3 border border-slate-700 mb-4">
-                <span class="text-slate-400">Total Images</span>
-                <span class="text-xl font-bold text-white">{{ images | length }}</span>
+            {% set training_count = images | rejectattr('split', 'eq', 'pending') | list | length %}
+            {% set pending_count = images | selectattr('split', 'eq', 'pending') | list | length %}
+            <div class="grid grid-cols-2 gap-2 mb-4">
+                <div class="flex flex-col items-center bg-slate-800/50 rounded-lg p-3 border border-slate-700">
+                    <span class="text-[10px] text-slate-400 uppercase tracking-wider">Training</span>
+                    <span class="text-xl font-bold text-white">{{ training_count }}</span>
+                    <span class="text-[10px] text-slate-500">train/valid/test</span>
+                </div>
+                <div class="flex flex-col items-center bg-slate-800/50 rounded-lg p-3 border border-slate-700">
+                    <span class="text-[10px] text-amber-300/80 uppercase tracking-wider">Pending</span>
+                    <span class="text-xl font-bold text-amber-300">{{ pending_count }}</span>
+                    <span class="text-[10px] text-slate-500">awaiting labels</span>
+                </div>
             </div>
 
             <div class="flex flex-col gap-2">
                 <button onclick="document.getElementById('upload-input').click()"
-                    class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2 px-4 rounded transition-colors flex justify-center items-center gap-2">
+                    class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2 px-4 rounded transition-colors flex justify-center items-center gap-2"
+                    title="Uploaded images go into the 'pending' holding area, not directly into train.">
                     <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24"
                         stroke="currentColor">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -144,17 +155,41 @@
                     </svg>
                     Upload Images
                 </button>
+                <p class="text-[10px] text-slate-500 -mt-1 leading-tight">Uploads land in <span class="text-amber-300">Pending</span> until labeled.</p>
                 <input type="file" id="upload-input" multiple accept="image/*" class="hidden"
                     onchange="handleImageUpload(event)">
 
+                <button id="move-unlabeled-btn" onclick="submitMoveUnlabeledToPending()"
+                    class="w-full bg-amber-700 hover:bg-amber-600 text-white font-medium py-2 px-4 rounded transition-colors flex justify-center items-center gap-2"
+                    title="Move every unlabeled image in train/valid/test into Pending so they don't get used for training.">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24"
+                        stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
+                    </svg>
+                    Unlabeled → Pending
+                </button>
+
                 <button onclick="document.getElementById('auto-split-modal').classList.remove('hidden')"
-                    class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2 px-4 rounded transition-colors flex justify-center items-center gap-2">
+                    class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2 px-4 rounded transition-colors flex justify-center items-center gap-2"
+                    title="Auto Split only shuffles train/valid/test — Pending images are left alone.">
                     <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24"
                         stroke="currentColor">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                             d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                     </svg>
                     Auto Split Dataset
+                </button>
+
+                <button id="clip-labels-btn" onclick="submitClipLabels()"
+                    class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2 px-4 rounded transition-colors flex justify-center items-center gap-2 border border-slate-600"
+                    title="Clip polygons to the image frame: insert boundary intersection vertices and drop off-screen ones (Sutherland-Hodgman)">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24"
+                        stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                    </svg>
+                    Clip Polygons to Frame
                 </button>
 
                 <div class="mt-4 border-t border-slate-700 pt-4 cursor-default">
@@ -239,6 +274,18 @@
                     <option value="name">Sort by Name</option>
                     <option value="diff_desc">Diff Score (High-Low)</option>
                     <option value="diff_asc">Diff Score (Low-High)</option>
+                    <option value="created_desc">Created (New-Old)</option>
+                    <option value="created_asc">Created (Old-New)</option>
+                    <option value="modified_desc">Modified (New-Old)</option>
+                    <option value="modified_asc">Modified (Old-New)</option>
+                    <option value="total_desc">Total Polygons (High-Low)</option>
+                    <option value="total_asc">Total Polygons (Low-High)</option>
+                    <option value="polymax_desc">Max Poly Points (High-Low)</option>
+                    <option value="polymax_asc">Max Poly Points (Low-High)</option>
+                    <option value="polymin_desc">Min Poly Points (High-Low)</option>
+                    <option value="polymin_asc">Min Poly Points (Low-High)</option>
+                    <option value="edge_desc">Near-Edge Score (High-Low)</option>
+                    <option value="edge_asc">Near-Edge Score (Low-High)</option>
                 </select>
                 <select id="filter-status" onchange="runFilters()"
                     class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-indigo-500">
@@ -248,11 +295,13 @@
                     <option value="duplicate">Duplicates</option>
                 </select>
                 <select id="filter-split" onchange="runFilters()"
-                    class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-indigo-500">
+                    class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-indigo-500"
+                    title="'All Splits' excludes Pending — Pending is only shown when explicitly selected.">
                     <option value="all">All Splits</option>
                     <option value="train">Train</option>
                     <option value="valid">Valid</option>
                     <option value="test">Test</option>
+                    <option value="pending">Pending</option>
                 </select>
                 <select id="filter-class" onchange="runFilters()"
                     class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-indigo-500">
@@ -280,7 +329,10 @@
                     data-name="{{ img.name }}" data-split="{{ img.split }}"
                     data-labeled="{{ 'true' if img.has_label else 'false' }}"
                     data-classes="{{ img.classes_present | join(',') }}"
-                    data-duplicate="{{ 'true' if img.is_duplicate else 'false' }}" data-diff="{{ img.diff_score }}">
+                    data-duplicate="{{ 'true' if img.is_duplicate else 'false' }}" data-diff="{{ img.diff_score }}"
+                    data-created="{{ img.created }}" data-modified="{{ img.modified }}"
+                    data-total="{{ img.total_polygons }}" data-polymax="{{ img.max_polygon_points }}"
+                    data-polymin="{{ img.min_polygon_points }}" data-edge="{{ img.edge_score }}">
                     <img src="{{ img.path }}" alt="{{ img.name }}"
                         class="object-cover w-full h-full opacity-80 group-hover:opacity-100 transition-opacity"
                         loading="lazy">
@@ -305,6 +357,12 @@
                                 class="ml-2 px-1 py-0.5 rounded bg-rose-500/20 text-[10px] text-rose-400 font-medium border border-rose-500/30">Diff:
                                 {{ "%.2f"|format(img.diff_score) }}</span>
                             {% endif %}
+                            {% if img.edge_score > 0.1 %}
+                            <span
+                                class="ml-2 px-1 py-0.5 rounded bg-fuchsia-500/20 text-[10px] text-fuchsia-300 font-medium border border-fuchsia-500/30"
+                                title="Polygon vertex is just inside the frame edge — may need to extend off-screen">Edge:
+                                {{ "%.2f"|format(img.edge_score) }}</span>
+                            {% endif %}
                         </div>
                     </div>
 
@@ -313,6 +371,7 @@
                         <option value="train" {% if img.split=='train' %}selected{% endif %}>TRAIN ▾</option>
                         <option value="valid" {% if img.split=='valid' %}selected{% endif %}>VALID ▾</option>
                         <option value="test" {% if img.split=='test' %}selected{% endif %}>TEST ▾</option>
+                        <option value="pending" {% if img.split=='pending' %}selected{% endif %}>PENDING ▾</option>
                     </select>
                 </a>
                 {% endfor %}
@@ -564,13 +623,25 @@
         const itemsArray = Array.from(items);
 
         // Sorting
+        const numKeyMap = {
+            diff: 'diff',
+            created: 'created',
+            modified: 'modified',
+            total: 'total',
+            polymax: 'polymax',
+            polymin: 'polymin',
+            edge: 'edge',
+        };
         itemsArray.sort((a, b) => {
             if (sortOrder === 'name') {
                 return a.dataset.name.localeCompare(b.dataset.name);
-            } else if (sortOrder === 'diff_desc') {
-                return parseFloat(b.dataset.diff) - parseFloat(a.dataset.diff);
-            } else if (sortOrder === 'diff_asc') {
-                return parseFloat(a.dataset.diff) - parseFloat(b.dataset.diff);
+            }
+            const m = sortOrder.match(/^(\w+)_(asc|desc)$/);
+            if (m && numKeyMap[m[1]]) {
+                const key = numKeyMap[m[1]];
+                const av = parseFloat(a.dataset[key]) || 0;
+                const bv = parseFloat(b.dataset[key]) || 0;
+                return m[2] === 'desc' ? bv - av : av - bv;
             }
             return 0;
         });
@@ -593,7 +664,12 @@
                 if (valStatus === 'duplicate' && isDuplicate === 'false') show = false;
             }
 
-            if (valSplit !== 'all' && split !== valSplit) {
+            // Pending is a holding area for unlabeled images: hidden under
+            // "All Splits" so it doesn't visually inflate the training set,
+            // and shown only when explicitly selected.
+            if (valSplit === 'all') {
+                if (split === 'pending') show = false;
+            } else if (split !== valSplit) {
                 show = false;
             }
 
@@ -758,6 +834,58 @@
         }
         btn.innerHTML = origText;
         btn.disabled = false;
+    }
+
+    async function submitClipLabels() {
+        if (!confirm("Clip polygons to the image frame?\n\nFor each polygon edge crossing the boundary, a new vertex will be inserted at the intersection and the off-screen vertex dropped. Polygons fully outside the frame will be removed.")) {
+            return;
+        }
+        const btn = document.getElementById('clip-labels-btn');
+        const origHTML = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = 'Clipping...';
+        try {
+            const resp = await fetch(`/api/dataset/${datasetName}/clip_labels`, { method: 'POST' });
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                alert(err.detail || 'Error clipping labels');
+                return;
+            }
+            const data = await resp.json();
+            alert(`Done.\nFiles modified: ${data.files_modified}\nPolygons clipped: ${data.polygons_clipped}\nPolygons dropped (fully outside): ${data.polygons_dropped}`);
+            window.location.reload();
+        } catch (e) {
+            alert('Network error');
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = origHTML;
+        }
+    }
+
+    async function submitMoveUnlabeledToPending() {
+        if (!confirm("Move every unlabeled image in train/valid/test into Pending?\n\nImages with empty or missing label files will be moved out of the training set so they don't pollute training. You can label them later and move them back.")) {
+            return;
+        }
+        const btn = document.getElementById('move-unlabeled-btn');
+        const orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = 'Moving...';
+        try {
+            const resp = await fetch(`/api/dataset/${datasetName}/move_unlabeled_to_pending`, { method: 'POST' });
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                alert(err.detail || 'Error moving unlabeled images');
+                return;
+            }
+            const data = await resp.json();
+            alert(`Moved ${data.moved} unlabeled image(s) to Pending.`);
+            window.location.reload();
+        } catch (e) {
+            alert('Network error');
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = orig;
+        }
     }
 
     async function normalizeAndReload(btn) {
