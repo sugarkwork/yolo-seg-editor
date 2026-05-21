@@ -1,0 +1,162 @@
+{% extends "base.html" %}
+
+{% block nav_actions %}
+<div class="flex gap-3 items-center">
+    <a href="/"
+        class="px-4 py-2 text-sm font-medium rounded-lg bg-slate-800 text-slate-300 hover:bg-slate-700 hover:text-white transition-colors border border-slate-700 flex items-center">
+        &larr; Back to Datasets
+    </a>
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto w-full flex flex-col gap-6">
+    <div>
+        <h1 class="text-3xl font-bold mb-2">Compare Datasets</h1>
+        <p class="text-slate-400">Pick two datasets to surface images only in one side and images whose labels differ.</p>
+    </div>
+
+    <div class="glass-panel p-6">
+        <div class="grid grid-cols-1 md:grid-cols-5 gap-4 items-end">
+            <div class="md:col-span-2">
+                <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">Dataset A</label>
+                <select id="dataset-a"
+                    class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-indigo-500">
+                    <option value="">-- choose --</option>
+                    {% for d in datasets %}
+                    <option value="{{ d }}" {% if d == preselect_a %}selected{% endif %}>{{ d }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="md:col-span-2">
+                <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">Dataset B</label>
+                <select id="dataset-b"
+                    class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-indigo-500">
+                    <option value="">-- choose --</option>
+                    {% for d in datasets %}
+                    <option value="{{ d }}" {% if d == preselect_b %}selected{% endif %}>{{ d }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div>
+                <button id="compare-btn"
+                    class="w-full bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 text-white px-4 py-2 font-medium rounded-lg transition-colors flex items-center justify-center gap-2 shadow-lg shadow-indigo-500/20">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24"
+                        stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
+                    </svg>
+                    <span id="compare-btn-text">Compare</span>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Summary stats -->
+    <div id="summary" class="hidden">
+        <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
+            <div class="glass-panel p-4">
+                <div class="text-xs text-slate-400 uppercase tracking-wider">A total</div>
+                <div id="stat-a" class="text-2xl font-semibold mt-1"></div>
+            </div>
+            <div class="glass-panel p-4">
+                <div class="text-xs text-slate-400 uppercase tracking-wider">B total</div>
+                <div id="stat-b" class="text-2xl font-semibold mt-1"></div>
+            </div>
+            <div class="glass-panel p-4">
+                <div class="text-xs text-slate-400 uppercase tracking-wider">Only in A</div>
+                <div id="stat-only-a" class="text-2xl font-semibold mt-1 text-amber-300"></div>
+            </div>
+            <div class="glass-panel p-4">
+                <div class="text-xs text-slate-400 uppercase tracking-wider">Only in B</div>
+                <div id="stat-only-b" class="text-2xl font-semibold mt-1 text-amber-300"></div>
+            </div>
+            <div class="glass-panel p-4">
+                <div class="text-xs text-slate-400 uppercase tracking-wider">Label diff</div>
+                <div id="stat-label-diff" class="text-2xl font-semibold mt-1 text-rose-300"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Class diff -->
+    <div id="class-diff-panel" class="glass-panel p-6 hidden">
+        <h2 class="text-lg font-semibold mb-3">Class definitions (data.yaml)</h2>
+        <div id="class-diff" class="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm"></div>
+    </div>
+
+    <!-- Side-by-side viewer (anchored above lists for quick scroll) -->
+    <div id="viewer" class="glass-panel p-6 hidden">
+        <div class="flex items-center justify-between mb-4 gap-4 flex-wrap">
+            <div>
+                <h2 class="text-lg font-semibold">Side-by-side view</h2>
+                <p id="viewer-stem" class="text-xs text-slate-400 font-mono"></p>
+            </div>
+            <div class="flex items-center gap-3 text-xs text-slate-300">
+                <label class="inline-flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" id="overlay-both" class="accent-indigo-500">
+                    Overlay both on left
+                </label>
+                <button id="viewer-close"
+                    class="bg-slate-700 hover:bg-slate-600 text-slate-200 px-3 py-1.5 rounded text-xs transition-colors">Close</button>
+            </div>
+        </div>
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div>
+                <div class="flex items-center justify-between mb-2">
+                    <div class="text-sm font-semibold"><span class="text-indigo-300" id="viewer-a-name"></span></div>
+                    <a id="viewer-a-edit" target="_blank"
+                        class="text-xs text-indigo-400 hover:text-indigo-300 underline">Open in editor &rarr;</a>
+                </div>
+                <div class="bg-slate-900/60 rounded overflow-hidden border border-slate-700 flex items-center justify-center min-h-[200px]">
+                    <canvas id="canvas-a" class="block max-w-full h-auto"></canvas>
+                </div>
+                <div id="legend-a" class="mt-2 flex flex-wrap gap-2 text-xs"></div>
+            </div>
+            <div>
+                <div class="flex items-center justify-between mb-2">
+                    <div class="text-sm font-semibold"><span class="text-emerald-300" id="viewer-b-name"></span></div>
+                    <a id="viewer-b-edit" target="_blank"
+                        class="text-xs text-emerald-400 hover:text-emerald-300 underline">Open in editor &rarr;</a>
+                </div>
+                <div class="bg-slate-900/60 rounded overflow-hidden border border-slate-700 flex items-center justify-center min-h-[200px]">
+                    <canvas id="canvas-b" class="block max-w-full h-auto"></canvas>
+                </div>
+                <div id="legend-b" class="mt-2 flex flex-wrap gap-2 text-xs"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Label diff list -->
+    <div id="diff-panel" class="glass-panel p-6 hidden">
+        <div class="flex items-center justify-between mb-4">
+            <h2 class="text-lg font-semibold">Label-different images <span id="diff-count" class="text-slate-400 font-normal text-sm"></span></h2>
+            <input id="diff-filter" type="text" placeholder="filter by stem…"
+                class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 focus:outline-none focus:border-indigo-500">
+        </div>
+        <div id="diff-list" class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3"></div>
+    </div>
+
+    <!-- Only in A -->
+    <div id="only-a-panel" class="glass-panel p-6 hidden">
+        <h2 class="text-lg font-semibold mb-4">Only in <span class="text-indigo-300" id="only-a-title"></span> <span id="only-a-count" class="text-slate-400 font-normal text-sm"></span></h2>
+        <div id="only-a-list" class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3"></div>
+    </div>
+
+    <!-- Only in B -->
+    <div id="only-b-panel" class="glass-panel p-6 hidden">
+        <h2 class="text-lg font-semibold mb-4">Only in <span class="text-emerald-300" id="only-b-title"></span> <span id="only-b-count" class="text-slate-400 font-normal text-sm"></span></h2>
+        <div id="only-b-list" class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3"></div>
+    </div>
+
+    <div id="empty-result" class="hidden glass-panel p-12 text-center text-slate-400 border-dashed">
+        <p class="text-lg">No differences found.</p>
+        <p class="text-sm mt-2 opacity-75">Both datasets contain the same images with the same labels.</p>
+    </div>
+
+    <div id="loading" class="hidden glass-panel p-12 text-center text-slate-400">
+        <p>Comparing datasets…</p>
+    </div>
+</div>
+
+<script src="/static/js/compare.js?v=1"></script>
+{% endblock %}

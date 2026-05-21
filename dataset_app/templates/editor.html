@@ -146,6 +146,46 @@
             </button>
             <p id="ai-error" class="text-rose-400 text-[10px] mt-1 hidden text-center"></p>
 
+            <!-- Polygon Shrink -->
+            <div class="mt-2 pt-3 border-t border-slate-700/50 flex flex-col gap-2">
+                <div class="flex items-end gap-2">
+                    <div class="flex flex-col flex-grow">
+                        <label class="text-[9px] text-slate-400 uppercase tracking-widest">Shrink % (of bbox short side)</label>
+                        <input type="number" id="shrink-percent" value="1.0" min="0" step="0.5" class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 w-full">
+                    </div>
+                    <button id="shrink-btn"
+                        class="bg-slate-700 hover:bg-slate-600 text-slate-100 font-medium py-1.5 px-3 rounded text-xs transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                        Shrink
+                    </button>
+                </div>
+                <p class="text-[10px] text-slate-400 leading-tight">Applies to selected polygon if any, otherwise all polygons.</p>
+                <p id="shrink-error" class="text-rose-400 text-[10px] hidden text-center"></p>
+            </div>
+
+            <!-- Snap to edges (GrabCut) -->
+            <div class="mt-2 pt-3 border-t border-slate-700/50 flex flex-col gap-2">
+                <div class="grid grid-cols-3 gap-2">
+                    <div class="flex flex-col">
+                        <label class="text-[9px] text-slate-400 uppercase tracking-widest">Iter</label>
+                        <input type="number" id="snap-iter" value="3" min="1" max="10" step="1" class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 w-full">
+                    </div>
+                    <div class="flex flex-col">
+                        <label class="text-[9px] text-slate-400 uppercase tracking-widest">Margin px</label>
+                        <input type="number" id="snap-margin" value="8" min="1" step="1" class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 w-full">
+                    </div>
+                    <div class="flex flex-col">
+                        <label class="text-[9px] text-slate-400 uppercase tracking-widest">Smooth px</label>
+                        <input type="number" id="snap-smooth" value="0.8" min="0" max="5" step="0.1" class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 w-full">
+                    </div>
+                </div>
+                <button id="snap-btn"
+                    class="w-full bg-emerald-700 hover:bg-emerald-600 text-white font-medium py-1.5 px-3 rounded text-xs transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                    Snap to edges
+                </button>
+                <p class="text-[10px] text-slate-400 leading-tight">GrabCut refinement. Selected polygon if any, otherwise all. Smooth: 0=raw pixel steps, 0.5=detailed, 1.0=balanced, 2.0+=coarse.</p>
+                <p id="snap-error" class="text-rose-400 text-[10px] hidden text-center"></p>
+            </div>
+
             <!-- Diff Score Checker -->
             <div class="mt-2 pt-3 border-t border-slate-700/50">
                 <button id="check-diff-btn"
@@ -172,6 +212,23 @@
                 <option value="test">TEST</option>
             </select>
             <p class="text-[10px] text-slate-400 leading-tight">Moving image auto-saves and redirects.</p>
+        </div>
+
+        <!-- Negative Sample Toggle -->
+        <div class="glass-panel p-4 flex flex-col gap-2">
+            <h3
+                class="flex items-center justify-between text-xs font-bold uppercase tracking-wider text-slate-300 pb-2 border-b border-slate-700/50">
+                Negative Sample
+            </h3>
+            <label class="flex items-start gap-2 cursor-pointer group">
+                <input type="checkbox" id="negative-sample-chk"
+                    class="mt-0.5 w-3.5 h-3.5 rounded bg-slate-900 border-slate-700 text-sky-500 focus:ring-sky-500 cursor-pointer">
+                <span class="text-xs text-slate-300 group-hover:text-white transition-colors leading-snug">
+                    No label needed (this image has no detection target).
+                </span>
+            </label>
+            <p class="text-[10px] text-slate-400 leading-tight">Hides this image from the "Unlabeled (needs work)" filter and skips it in Save&amp;Next.</p>
+            <p id="negative-sample-status" class="text-[10px] text-sky-300 hidden">Marked as negative sample.</p>
         </div>
 
         <!-- Instructions Panel -->
@@ -231,5 +288,5 @@
 </div>
 
 <!-- Add vanilla JS script -->
-<script src="/static/js/editor.js"></script>
+<script src="/static/js/editor.js?v=negsample1"></script>
 {% endblock %}

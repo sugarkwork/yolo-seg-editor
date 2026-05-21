@@ -192,6 +192,19 @@
                     Clip Polygons to Frame
                 </button>
 
+                {% if hooks_local_enabled %}
+                <button id="archive-upload-btn" onclick="submitArchiveUpload()"
+                    class="w-full bg-violet-700 hover:bg-violet-600 text-white font-medium py-2 px-4 rounded transition-colors flex justify-center items-center gap-2 border border-violet-600"
+                    title="Archive this dataset and upload to the configured server (hooks_local)">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24"
+                        stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1M16 12l-4-4m0 0l-4 4m4-4v12" />
+                    </svg>
+                    Archive & Upload
+                </button>
+                {% endif %}
+
                 <div class="mt-4 border-t border-slate-700 pt-4 cursor-default">
                     <h3 class="text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">Quality Control</h3>
                     <div class="flex flex-col gap-2">
@@ -251,12 +264,16 @@
                                     <tr class="text-slate-400 border-b border-slate-700">
                                         <th class="text-left py-1 font-medium">#</th>
                                         <th class="text-left py-1 font-medium">Model</th>
-                                        <th class="text-right py-1 font-medium">mIoU</th>
+                                        <th class="text-right py-1 font-medium" title="Composite score (0-100): weighted sum of mask IoU, class recall, and critical-class IoU">Score</th>
+                                        <th class="text-right py-1 font-medium" title="Overall mask IoU (any class union)">mIoU</th>
+                                        <th class="text-right py-1 font-medium" title="Per-image fraction of GT classes that the model predicted at least once">Class</th>
+                                        <th class="text-right py-1 font-medium" title="IoU restricted to the critical classes (e.g. penis, pussy)">Crit</th>
                                         <th class="text-right py-1 font-medium">Time</th>
                                     </tr>
                                 </thead>
                                 <tbody id="benchmark-results-tbody"></tbody>
                             </table>
+                            <p id="benchmark-weights" class="text-[10px] text-slate-500 mt-1"></p>
                         </div>
                     </div>
                 </div>
@@ -288,10 +305,12 @@
                     <option value="edge_asc">Near-Edge Score (Low-High)</option>
                 </select>
                 <select id="filter-status" onchange="runFilters()"
-                    class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-indigo-500">
+                    class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-indigo-500"
+                    title="'Unlabeled' excludes images explicitly marked as negative samples.">
                     <option value="all">All Status</option>
                     <option value="labeled">Labeled</option>
-                    <option value="unlabeled">Unlabeled</option>
+                    <option value="unlabeled">Unlabeled (needs work)</option>
+                    <option value="negative">Negative Sample</option>
                     <option value="duplicate">Duplicates</option>
                 </select>
                 <select id="filter-split" onchange="runFilters()"
@@ -328,6 +347,7 @@
                     class="gallery-item block group relative rounded-lg overflow-hidden border border-slate-700 hover:border-indigo-500 transition-colors aspect-square bg-slate-900"
                     data-name="{{ img.name }}" data-split="{{ img.split }}"
                     data-labeled="{{ 'true' if img.has_label else 'false' }}"
+                    data-negative="{{ 'true' if img.is_negative else 'false' }}"
                     data-classes="{{ img.classes_present | join(',') }}"
                     data-duplicate="{{ 'true' if img.is_duplicate else 'false' }}" data-diff="{{ img.diff_score }}"
                     data-created="{{ img.created }}" data-modified="{{ img.modified }}"
@@ -344,6 +364,10 @@
                             <span
                                 class="w-2 h-2 rounded-full bg-emerald-500 mr-1.5 shadow-[0_0_8px_rgba(16,185,129,0.8)]"></span>
                             <span class="text-[10px] text-emerald-400 font-medium">Labeled</span>
+                            {% elif img.is_negative %}
+                            <span
+                                class="w-2 h-2 rounded-full bg-sky-400 mr-1.5 shadow-[0_0_8px_rgba(56,189,248,0.7)]"></span>
+                            <span class="text-[10px] text-sky-300 font-medium" title="Marked as negative sample — intentionally has no labels">Negative</span>
                             {% else %}
                             <span class="w-2 h-2 rounded-full bg-slate-500 mr-1.5"></span>
                             <span class="text-[10px] text-slate-400 font-medium">Unlabeled</span>
@@ -570,11 +594,26 @@
         const wrap = document.getElementById('benchmark-results');
         const tbody = document.getElementById('benchmark-results-tbody');
         const meta = document.getElementById('benchmark-meta');
+        const weightsEl = document.getElementById('benchmark-weights');
         tbody.innerHTML = '';
 
         const splitLabel = data.split === 'all' ? 'all splits' : `${data.split} split`;
         const ranAt = data.ran_at ? ` · ${data.ran_at}` : '';
         meta.textContent = `${data.image_count} img · ${splitLabel} · ${data.device || 'cpu'}${ranAt}`;
+
+        if (weightsEl) {
+            const w = data.weights;
+            const crit = (data.critical_classes_used && data.critical_classes_used.length)
+                ? data.critical_classes_used.join(', ')
+                : '—';
+            if (w) {
+                weightsEl.textContent = `Weights: mask ${(w.mask * 100).toFixed(0)} / class ${(w.class * 100).toFixed(0)} / critical ${(w.critical * 100).toFixed(0)} · critical classes: ${crit}`;
+            } else {
+                weightsEl.textContent = '';
+            }
+        }
+
+        const pct = (v) => (v === null || v === undefined) ? '—' : `${(v * 100).toFixed(1)}%`;
 
         data.results.forEach((r, i) => {
             const tr = document.createElement('tr');
@@ -582,12 +621,15 @@
             const rankClass = r.error
                 ? 'text-rose-400'
                 : (i === 0 ? 'text-emerald-400 font-bold' : (i === 1 ? 'text-amber-300' : 'text-slate-300'));
-            const iouCell = r.error ? '—' : `${(r.mean_iou * 100).toFixed(1)}%`;
+            const scoreCell = (r.score === null || r.score === undefined) ? '—' : r.score.toFixed(1);
             const errMark = r.error ? `<span title="${r.error.replace(/"/g, '&quot;')}" class="text-rose-400 ml-1">⚠</span>` : '';
             tr.innerHTML = `
                 <td class="py-1 ${rankClass}">${i + 1}</td>
                 <td class="py-1 truncate max-w-[8rem] ${rankClass}" title="${r.model}">${r.model}${errMark}</td>
-                <td class="py-1 text-right ${rankClass}">${iouCell}</td>
+                <td class="py-1 text-right ${rankClass}">${scoreCell}</td>
+                <td class="py-1 text-right text-slate-400">${pct(r.mean_iou)}</td>
+                <td class="py-1 text-right text-slate-400">${pct(r.class_recall)}</td>
+                <td class="py-1 text-right text-slate-400">${pct(r.critical_iou)}</td>
                 <td class="py-1 text-right text-slate-500">${r.elapsed_sec.toFixed(1)}s</td>
             `;
             tbody.appendChild(tr);
@@ -653,6 +695,7 @@
         itemsArray.forEach(item => {
             const split = item.dataset.split;
             const labeled = item.dataset.labeled;
+            const negative = item.dataset.negative;
             const classes = item.dataset.classes ? item.dataset.classes.split(',') : [];
             const isDuplicate = item.dataset.duplicate;
 
@@ -660,7 +703,9 @@
 
             if (valStatus !== 'all') {
                 if (valStatus === 'labeled' && labeled === 'false') show = false;
-                if (valStatus === 'unlabeled' && labeled === 'true') show = false;
+                // Truly "needs work": unlabeled AND not flagged as a negative sample.
+                if (valStatus === 'unlabeled' && (labeled === 'true' || negative === 'true')) show = false;
+                if (valStatus === 'negative' && negative !== 'true') show = false;
                 if (valStatus === 'duplicate' && isDuplicate === 'false') show = false;
             }
 
@@ -834,6 +879,33 @@
         }
         btn.innerHTML = origText;
         btn.disabled = false;
+    }
+
+    async function submitArchiveUpload() {
+        if (!confirm(`Archive "${datasetName}" and upload to the configured server?`)) {
+            return;
+        }
+        const btn = document.getElementById('archive-upload-btn');
+        if (!btn) return;
+        const origHTML = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = 'Archiving & uploading...';
+        try {
+            const resp = await fetch(`/api/dataset/${datasetName}/archive_upload`, { method: 'POST' });
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                alert(err.detail || 'Upload failed');
+                return;
+            }
+            const data = await resp.json();
+            const mb = (data.bytes_uploaded / (1024 * 1024)).toFixed(2);
+            alert(`Uploaded ${mb} MB.\nServer response: HTTP ${data.upload_response_status}`);
+        } catch (e) {
+            alert('Network error');
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = origHTML;
+        }
     }
 
     async function submitClipLabels() {

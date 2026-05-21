@@ -88,6 +88,35 @@ def _compute_label_polygon_stats(label_path: Path):
         "edge_score": max(edge_scores) if edge_scores else 0.0,
     }
 
+def _negative_samples_file(dataset_name: str) -> Path:
+    """Per-dataset list of images intentionally left unlabeled (true negatives).
+
+    Stored at the dataset root, not under any split folder, so YOLO training
+    tooling never sees it. Keyed by image filename (the hash-stem.ext form
+    after normalize_filenames runs).
+    """
+    return DATASETS_DIR / dataset_name / "negative_samples.json"
+
+
+def load_negative_samples(dataset_name: str) -> set:
+    p = _negative_samples_file(dataset_name)
+    if not p.exists():
+        return set()
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data) if isinstance(data, list) else set()
+    except Exception:
+        return set()
+
+
+def save_negative_samples(dataset_name: str, names) -> None:
+    p = _negative_samples_file(dataset_name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(sorted(names), f)
+
+
 META_SCHEMA_VERSION = 2
 
 def get_image_meta(dataset_name: str, force_rebuild: bool = False) -> dict:
@@ -194,6 +223,7 @@ async def read_dataset(request: Request, dataset_name: str):
             pass
 
     image_meta = get_image_meta(dataset_name)
+    negative_samples = load_negative_samples(dataset_name)
 
     # Let's find images (looking into train/images for now, or val/images, test/images)
     images = []
@@ -228,6 +258,7 @@ async def read_dataset(request: Request, dataset_name: str):
             "path": f"/datasets/{dataset_name}/{split}/images/{img_file.name}",
             "label_path": f"/datasets/{dataset_name}/{split}/labels/{label_file.name}",
             "has_label": label_file.exists(),
+            "is_negative": img_file.name in negative_samples,
             "split": split,
             "classes_present": list(classes_present),
             "is_duplicate": stem_counts[img_file.stem] > 1,
@@ -244,7 +275,8 @@ async def read_dataset(request: Request, dataset_name: str):
         request=request, name="dataset.html", context={
             "dataset_name": dataset_name,
             "classes": classes,
-            "images": images
+            "images": images,
+            "hooks_local_enabled": HOOKS_LOCAL_ENABLED,
         }
     )
 
@@ -269,7 +301,7 @@ async def read_editor(request: Request, dataset_name: str, img: str, lbl: str):
     )
 
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 
 class Point(BaseModel):
     x: float
@@ -500,6 +532,170 @@ async def api_auto_segment(req: AutoSegmentRequest):
             
     return {"polygons": predicted_polygons}
 
+class ShrinkPolygonsRequest(BaseModel):
+    polygons: List[Polygon]
+    shrink_percent: float
+    indices: Optional[List[int]] = None
+
+@app.post("/api/shrink_polygons")
+async def api_shrink_polygons(req: ShrinkPolygonsRequest):
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        raise HTTPException(status_code=500, detail="cv2/numpy not installed")
+
+    if req.shrink_percent <= 0:
+        return {"polygons": [{"classId": p.classId, "points": [{"x": pt.x, "y": pt.y} for pt in p.points]} for p in req.polygons]}
+
+    target_set = set(req.indices) if req.indices is not None else None
+    out = []
+    for i, poly in enumerate(req.polygons):
+        passthrough = (target_set is not None and i not in target_set) or len(poly.points) < 3
+        if passthrough:
+            out.append({"classId": poly.classId, "points": [{"x": pt.x, "y": pt.y} for pt in poly.points]})
+            continue
+
+        pts_arr = np.array([(pt.x, pt.y) for pt in poly.points], dtype=np.float64)
+        min_xy = pts_arr.min(axis=0)
+        max_xy = pts_arr.max(axis=0)
+        bbox_w = float(max_xy[0] - min_xy[0])
+        bbox_h = float(max_xy[1] - min_xy[1])
+        min_side = min(bbox_w, bbox_h)
+        if min_side <= 0:
+            out.append({"classId": poly.classId, "points": []})
+            continue
+
+        shrink_px = max(1, int(round(min_side * req.shrink_percent / 100.0)))
+        pad = shrink_px + 2
+        mask_w = int(np.ceil(bbox_w)) + 2 * pad
+        mask_h = int(np.ceil(bbox_h)) + 2 * pad
+        mask = np.zeros((mask_h, mask_w), dtype=np.uint8)
+
+        local_pts = np.round(pts_arr - min_xy + pad).astype(np.int32)
+        cv2.fillPoly(mask, [local_pts], 1)
+
+        k = 2 * shrink_px + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        eroded = cv2.erode(mask, kernel)
+
+        contours, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            out.append({"classId": poly.classId, "points": []})
+            continue
+
+        contour = max(contours, key=cv2.contourArea)
+        contour = cv2.approxPolyDP(contour, 1.0, True)
+        if len(contour) < 3:
+            out.append({"classId": poly.classId, "points": []})
+            continue
+
+        new_pts = [
+            {"x": float(c[0][0] - pad + min_xy[0]), "y": float(c[0][1] - pad + min_xy[1])}
+            for c in contour
+        ]
+        out.append({"classId": poly.classId, "points": new_pts})
+
+    return {"polygons": out}
+
+class SnapPolygonsRequest(BaseModel):
+    image_path: str
+    polygons: List[Polygon]
+    indices: Optional[List[int]] = None
+    iterations: int = 3
+    margin_px: int = 8
+    smooth_px: float = 0.8
+
+@app.post("/api/snap_polygons")
+async def api_snap_polygons(req: SnapPolygonsRequest):
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        raise HTTPException(status_code=500, detail="cv2/numpy not installed")
+
+    decoded_img_path = urllib.parse.unquote(req.image_path)
+    physical_img_path = BASE_DIR / decoded_img_path.lstrip("/")
+    if not physical_img_path.exists():
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    img_bgr = cv2.imread(str(physical_img_path))
+    if img_bgr is None:
+        raise HTTPException(status_code=500, detail="Failed to read image")
+    H_img, W_img = img_bgr.shape[:2]
+
+    iterations = max(1, min(int(req.iterations), 10))
+    margin = max(1, int(req.margin_px))
+    smooth_eps = max(0.0, min(float(req.smooth_px), 5.0))
+    target_set = set(req.indices) if req.indices is not None else None
+
+    out = []
+    for i, poly in enumerate(req.polygons):
+        passthrough = (target_set is not None and i not in target_set) or len(poly.points) < 3
+        if passthrough:
+            out.append({"classId": poly.classId, "points": [{"x": pt.x, "y": pt.y} for pt in poly.points]})
+            continue
+
+        pts = np.array([(pt.x, pt.y) for pt in poly.points], dtype=np.float64)
+        min_xy = pts.min(axis=0)
+        max_xy = pts.max(axis=0)
+
+        x0 = max(0, int(np.floor(min_xy[0])) - margin)
+        y0 = max(0, int(np.floor(min_xy[1])) - margin)
+        x1 = min(W_img, int(np.ceil(max_xy[0])) + margin)
+        y1 = min(H_img, int(np.ceil(max_xy[1])) + margin)
+
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            out.append({"classId": poly.classId, "points": [{"x": pt.x, "y": pt.y} for pt in poly.points]})
+            continue
+
+        crop = img_bgr[y0:y1, x0:x1].copy()
+        Hc, Wc = crop.shape[:2]
+
+        init_mask = np.full((Hc, Wc), cv2.GC_PR_BGD, dtype=np.uint8)
+        local_pts = np.round(pts - np.array([x0, y0])).astype(np.int32)
+        cv2.fillPoly(init_mask, [local_pts], int(cv2.GC_PR_FGD))
+
+        # Seed a definite-foreground core by eroding the polygon — keeps GrabCut
+        # anchored when the polygon is mostly correct.
+        inner = np.zeros((Hc, Wc), dtype=np.uint8)
+        cv2.fillPoly(inner, [local_pts], 1)
+        erode_k = max(3, int(min(Hc, Wc) * 0.08))
+        if erode_k % 2 == 0:
+            erode_k += 1
+        inner_eroded = cv2.erode(inner, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_k, erode_k)))
+        init_mask[inner_eroded == 1] = cv2.GC_FGD
+
+        bgd_model = np.zeros((1, 65), dtype=np.float64)
+        fgd_model = np.zeros((1, 65), dtype=np.float64)
+
+        try:
+            cv2.grabCut(crop, init_mask, None, bgd_model, fgd_model, iterations, cv2.GC_INIT_WITH_MASK)
+        except Exception:
+            out.append({"classId": poly.classId, "points": [{"x": pt.x, "y": pt.y} for pt in poly.points]})
+            continue
+
+        fg_mask = np.where((init_mask == cv2.GC_FGD) | (init_mask == cv2.GC_PR_FGD), 1, 0).astype(np.uint8)
+        contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            out.append({"classId": poly.classId, "points": [{"x": pt.x, "y": pt.y} for pt in poly.points]})
+            continue
+
+        contour = max(contours, key=cv2.contourArea)
+        if smooth_eps > 0.0:
+            contour = cv2.approxPolyDP(contour, smooth_eps, True)
+        if len(contour) < 3:
+            out.append({"classId": poly.classId, "points": [{"x": pt.x, "y": pt.y} for pt in poly.points]})
+            continue
+
+        new_pts = [
+            {"x": float(c[0][0] + x0), "y": float(c[0][1] + y0)}
+            for c in contour
+        ]
+        out.append({"classId": poly.classId, "points": new_pts})
+
+    return {"polygons": out}
+
 class AutoCheckRequest(BaseModel):
     model_name: str
 
@@ -660,6 +856,14 @@ async def api_auto_check_single(dataset_name: str, req: AutoCheckSingleRequest):
 class BenchmarkRequest(BaseModel):
     model_names: List[str]
     split: str = "test"  # "train" | "valid" | "test" | "val" | "all"
+    # Composite score weights. Default weighting reflects the censoring use case:
+    # missing a class is much worse than imperfect mask shape.
+    weight_mask: float = 0.30
+    weight_class: float = 0.40
+    weight_critical: float = 0.30
+    # Class names that should be detected with high spatial accuracy (case-insensitive).
+    # Names absent from the dataset's data.yaml are silently dropped.
+    critical_classes: List[str] = ["penis", "pussy"]
 
 @app.post("/api/dataset/{dataset_name}/benchmark")
 async def api_benchmark(dataset_name: str, req: BenchmarkRequest):
@@ -681,6 +885,23 @@ async def api_benchmark(dataset_name: str, req: BenchmarkRequest):
     except ImportError as e:
         raise HTTPException(status_code=500, detail=f"Missing required libraries: {e}")
 
+    # Resolve dataset class list and intersect critical classes against it.
+    yaml_path = get_yaml_path(dataset_name)
+    if not yaml_path.exists():
+        raise HTTPException(status_code=404, detail="data.yaml not found")
+    with open(yaml_path, "r", encoding="utf-8") as f:
+        data_yaml = yaml.safe_load(f)
+    dataset_classes = data_yaml.get("names", []) or []
+    name_to_id = {n.lower(): i for i, n in enumerate(dataset_classes)}
+    critical_ids = []
+    critical_names_used = []
+    for n in req.critical_classes:
+        key = n.lower()
+        if key in name_to_id:
+            critical_ids.append(name_to_id[key])
+            critical_names_used.append(dataset_classes[name_to_id[key]])
+    critical_id_set = set(critical_ids)
+
     # Collect images and corresponding label paths from the requested split(s).
     image_paths = []
     label_paths = []
@@ -699,26 +920,60 @@ async def api_benchmark(dataset_name: str, req: BenchmarkRequest):
 
     H, W = 640, 640
 
-    # Pre-rasterize ground-truth masks once; they don't depend on the model.
-    gt_masks = []
+    # Pre-rasterize ground truth: overall (any-class union) + per-critical-class
+    # masks, plus the set of class IDs present per image.
+    gt_overall = []
+    gt_critical_masks = []  # list of dict {cls_id: mask}
+    gt_class_sets = []
     for lbl_file in label_paths:
-        gt_mask = np.zeros((H, W), dtype=np.uint8)
+        overall = np.zeros((H, W), dtype=np.uint8)
+        crit = {}
+        cls_set = set()
         if lbl_file.exists():
             with open(lbl_file, "r", encoding="utf-8") as f:
                 for line in f:
                     parts = line.strip().split()
                     if len(parts) >= 7 and len(parts) % 2 == 1:
+                        try:
+                            cls_id = int(float(parts[0]))
+                        except ValueError:
+                            continue
                         coords = [float(x) for x in parts[1:]]
                         pts = np.array(
                             [[int(coords[i] * W), int(coords[i + 1] * H)] for i in range(0, len(coords), 2)],
                             dtype=np.int32,
                         )
-                        cv2.fillPoly(gt_mask, [pts], 1)
-        gt_masks.append(gt_mask)
+                        cv2.fillPoly(overall, [pts], 1)
+                        cls_set.add(cls_id)
+                        if cls_id in critical_id_set:
+                            if cls_id not in crit:
+                                crit[cls_id] = np.zeros((H, W), dtype=np.uint8)
+                            cv2.fillPoly(crit[cls_id], [pts], 1)
+        gt_overall.append(overall)
+        gt_critical_masks.append(crit)
+        gt_class_sets.append(cls_set)
 
     use_cuda = torch.cuda.is_available()
     device = 0 if use_cuda else "cpu"
     paths_str = [str(p) for p in image_paths]
+
+    w_mask = float(req.weight_mask)
+    w_class = float(req.weight_class)
+    w_critical = float(req.weight_critical)
+
+    def composite_from_means(mean_mask, mean_class, mean_critical):
+        total = 0.0
+        weight_used = 0.0
+        if mean_mask is not None:
+            total += w_mask * mean_mask
+            weight_used += w_mask
+        if mean_class is not None:
+            total += w_class * mean_class
+            weight_used += w_class
+        if mean_critical is not None:
+            total += w_critical * mean_critical
+            weight_used += w_critical
+        return (total / weight_used * 100.0) if weight_used > 0 else 0.0
 
     results = []
     for model_name in req.model_names:
@@ -727,18 +982,32 @@ async def api_benchmark(dataset_name: str, req: BenchmarkRequest):
             results.append({
                 "model": model_name,
                 "error": "Model file not found",
+                "score": 0.0,
                 "mean_iou": 0.0,
                 "median_iou": 0.0,
+                "class_recall": None,
+                "critical_iou": None,
                 "image_count": 0,
                 "elapsed_sec": 0.0,
             })
             continue
 
-        ious = []
+        mask_ious = []
+        class_recalls = []
+        critical_iou_values = []
         t0 = time.time()
         model = None
         try:
             model = YOLO(str(model_path))
+            # Build a translation table from model class IDs to dataset class IDs
+            # via name match (case-insensitive). Predictions whose model class has
+            # no corresponding dataset class are ignored for class-aware metrics.
+            model_to_dataset = {}
+            for mid, mname in (model.names or {}).items():
+                key = str(mname).lower()
+                if key in name_to_id:
+                    model_to_dataset[int(mid)] = name_to_id[key]
+
             stream = model.predict(
                 source=paths_str,
                 save=False,
@@ -750,27 +1019,66 @@ async def api_benchmark(dataset_name: str, req: BenchmarkRequest):
                 stream=True,
             )
             for idx, res in enumerate(stream):
-                pred_mask = np.zeros((H, W), dtype=np.uint8)
-                if res.masks is not None:
-                    for mask_xyn in res.masks.xyn:
+                pred_overall = np.zeros((H, W), dtype=np.uint8)
+                pred_critical = {}
+                pred_class_set = set()
+                if res.masks is not None and res.boxes is not None:
+                    cls_ids = res.boxes.cls.tolist()
+                    for mask_xyn, mcls_f in zip(res.masks.xyn, cls_ids):
+                        mcls = int(mcls_f)
                         pts = np.array(
                             [[int(x * W), int(y * H)] for x, y in mask_xyn],
                             dtype=np.int32,
                         )
-                        cv2.fillPoly(pred_mask, [pts], 1)
+                        cv2.fillPoly(pred_overall, [pts], 1)
+                        if mcls in model_to_dataset:
+                            dcls = model_to_dataset[mcls]
+                            pred_class_set.add(dcls)
+                            if dcls in critical_id_set:
+                                if dcls not in pred_critical:
+                                    pred_critical[dcls] = np.zeros((H, W), dtype=np.uint8)
+                                cv2.fillPoly(pred_critical[dcls], [pts], 1)
 
-                gt_mask = gt_masks[idx]
-                inter = int(np.logical_and(gt_mask, pred_mask).sum())
-                union = int(np.logical_or(gt_mask, pred_mask).sum())
-                iou = 1.0 if union == 0 else inter / union
-                ious.append(float(iou))
+                gt_o = gt_overall[idx]
+                inter = int(np.logical_and(gt_o, pred_overall).sum())
+                union = int(np.logical_or(gt_o, pred_overall).sum())
+                mask_iou = 1.0 if union == 0 else inter / union
+                mask_ious.append(float(mask_iou))
+
+                gt_cls = gt_class_sets[idx]
+                if gt_cls:
+                    matched = gt_cls & pred_class_set
+                    class_recalls.append(len(matched) / len(gt_cls))
+                # When GT has no classes, recall is undefined — skip rather than
+                # rewarding empty predictions with a free 1.0.
+
+                per_img_critical = []
+                for cid in critical_ids:
+                    gt_m = gt_critical_masks[idx].get(cid)
+                    pr_m = pred_critical.get(cid)
+                    if gt_m is None and pr_m is None:
+                        continue
+                    if gt_m is None or pr_m is None:
+                        per_img_critical.append(0.0)
+                        continue
+                    ci = int(np.logical_and(gt_m, pr_m).sum())
+                    cu = int(np.logical_or(gt_m, pr_m).sum())
+                    per_img_critical.append(1.0 if cu == 0 else ci / cu)
+                if per_img_critical:
+                    critical_iou_values.append(float(np.mean(per_img_critical)))
         except Exception as e:
+            mean_mask = float(np.mean(mask_ious)) if mask_ious else None
+            mean_class = float(np.mean(class_recalls)) if class_recalls else None
+            mean_crit = float(np.mean(critical_iou_values)) if critical_iou_values else None
             results.append({
                 "model": model_name,
                 "error": str(e),
-                "mean_iou": float(np.mean(ious)) if ious else 0.0,
-                "median_iou": float(np.median(ious)) if ious else 0.0,
-                "image_count": len(ious),
+                "score": round(composite_from_means(mean_mask, mean_class, mean_crit), 2),
+                "mean_iou": round(mean_mask, 4) if mean_mask is not None else 0.0,
+                "median_iou": round(float(np.median(mask_ious)), 4) if mask_ious else 0.0,
+                "class_recall": round(mean_class, 4) if mean_class is not None else None,
+                "critical_iou": round(mean_crit, 4) if mean_crit is not None else None,
+                "image_count": len(mask_ious),
                 "elapsed_sec": round(time.time() - t0, 2),
             })
             continue
@@ -780,15 +1088,21 @@ async def api_benchmark(dataset_name: str, req: BenchmarkRequest):
                 torch.cuda.empty_cache()
 
         elapsed = time.time() - t0
+        mean_mask = float(np.mean(mask_ious)) if mask_ious else None
+        mean_class = float(np.mean(class_recalls)) if class_recalls else None
+        mean_crit = float(np.mean(critical_iou_values)) if critical_iou_values else None
         results.append({
             "model": model_name,
-            "mean_iou": round(float(np.mean(ious)), 4) if ious else 0.0,
-            "median_iou": round(float(np.median(ious)), 4) if ious else 0.0,
-            "image_count": len(ious),
+            "score": round(composite_from_means(mean_mask, mean_class, mean_crit), 2),
+            "mean_iou": round(mean_mask, 4) if mean_mask is not None else 0.0,
+            "median_iou": round(float(np.median(mask_ious)), 4) if mask_ious else 0.0,
+            "class_recall": round(mean_class, 4) if mean_class is not None else None,
+            "critical_iou": round(mean_crit, 4) if mean_crit is not None else None,
+            "image_count": len(mask_ious),
             "elapsed_sec": round(elapsed, 2),
         })
 
-    results.sort(key=lambda r: r.get("mean_iou", 0.0), reverse=True)
+    results.sort(key=lambda r: r.get("score", 0.0), reverse=True)
 
     payload = {
         "status": "ok",
@@ -796,6 +1110,9 @@ async def api_benchmark(dataset_name: str, req: BenchmarkRequest):
         "image_count": len(image_paths),
         "device": "cuda" if use_cuda else "cpu",
         "ran_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "weights": {"mask": w_mask, "class": w_class, "critical": w_critical},
+        "critical_classes_used": critical_names_used,
+        "critical_classes_requested": list(req.critical_classes),
         "results": results,
     }
 
@@ -932,6 +1249,7 @@ async def api_move_unlabeled_to_pending(dataset_name: str):
     if not (DATASETS_DIR / dataset_name).exists():
         raise HTTPException(status_code=404, detail="Dataset not found")
 
+    negatives = load_negative_samples(dataset_name)
     dest_img_dir = DATASETS_DIR / dataset_name / PENDING_SPLIT / "images"
     dest_img_dir.mkdir(parents=True, exist_ok=True)
 
@@ -943,6 +1261,8 @@ async def api_move_unlabeled_to_pending(dataset_name: str):
             continue
         for img_file in list(images_dir.glob("*.*")):
             if img_file.suffix.lower() not in IMAGE_EXTS:
+                continue
+            if img_file.name in negatives:
                 continue
             lbl_file = labels_dir / (img_file.stem + ".txt")
             if lbl_file.exists() and lbl_file.stat().st_size > 0:
@@ -1246,11 +1566,11 @@ async def api_normalize_filenames(dataset_name: str):
 
     # Update auto_check.json keys to follow renames; drop entries for removed images.
     scores_file = DATASETS_DIR / dataset_name / "auto_check.json"
+    current_image_names = {p.name for p in seen_hashes.values()}
     if scores_file.exists():
         try:
             with open(scores_file, "r") as f:
                 scores = json.load(f)
-            current_image_names = {p.name for p in seen_hashes.values()}
             new_scores = {}
             for k, v in scores.items():
                 new_k = rename_map.get(k, k)
@@ -1261,12 +1581,50 @@ async def api_normalize_filenames(dataset_name: str):
         except Exception:
             pass
 
+    # Mirror renames into negative_samples.json; drop entries for removed images.
+    negatives = load_negative_samples(dataset_name)
+    if negatives:
+        new_negatives = set()
+        for name in negatives:
+            mapped = rename_map.get(name, name)
+            if mapped in current_image_names:
+                new_negatives.add(mapped)
+        if new_negatives != negatives:
+            save_negative_samples(dataset_name, new_negatives)
+
     return {
         "status": "ok",
         "renamed": renamed,
         "deleted_duplicates": deleted_dup,
         "deleted_orphans": deleted_orphan,
     }
+
+class ToggleNegativeRequest(BaseModel):
+    image_filename: str
+    value: bool
+
+
+@app.get("/api/dataset/{dataset_name}/negative_samples")
+async def api_get_negative_samples(dataset_name: str):
+    if not (DATASETS_DIR / dataset_name).exists():
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    return {"items": sorted(load_negative_samples(dataset_name))}
+
+
+@app.post("/api/dataset/{dataset_name}/toggle_negative")
+async def api_toggle_negative(dataset_name: str, req: ToggleNegativeRequest):
+    if not (DATASETS_DIR / dataset_name).exists():
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    if not req.image_filename or "/" in req.image_filename or "\\" in req.image_filename:
+        raise HTTPException(status_code=400, detail="image_filename must be a bare filename")
+    negatives = load_negative_samples(dataset_name)
+    if req.value:
+        negatives.add(req.image_filename)
+    else:
+        negatives.discard(req.image_filename)
+    save_negative_samples(dataset_name, negatives)
+    return {"status": "ok", "image_filename": req.image_filename, "is_negative": req.value}
+
 
 class DeleteImageRequest(BaseModel):
     image_path: str
@@ -1299,10 +1657,15 @@ async def api_delete_image(dataset_name: str, req: DeleteImageRequest):
         
         if img_file.exists():
             img_file.unlink()
-        
+
         if lbl_file.exists():
             lbl_file.unlink()
-            
+
+        negatives = load_negative_samples(dataset_name)
+        if filename in negatives:
+            negatives.discard(filename)
+            save_negative_samples(dataset_name, negatives)
+
         return {"status": "ok"}
     except Exception as e:
         print(f"Delete image error: {e}")
@@ -1310,15 +1673,18 @@ async def api_delete_image(dataset_name: str, req: DeleteImageRequest):
 
 @app.get("/api/dataset/{dataset_name}/next_unlabeled")
 async def api_next_unlabeled(dataset_name: str):
+    negatives = load_negative_samples(dataset_name)
     # Scan splits in order for an image without a label file
     for split in ALL_SPLITS:
         images_dir = DATASETS_DIR / dataset_name / split / "images"
         labels_dir = DATASETS_DIR / dataset_name / split / "labels"
         if not images_dir.exists():
             continue
-            
+
         for img_file in sorted(images_dir.glob("*.*")):
             if img_file.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]:
+                if img_file.name in negatives:
+                    continue
                 label_file = labels_dir / (img_file.stem + ".txt")
                 if not label_file.exists() or label_file.stat().st_size == 0:
                     return {
@@ -1381,5 +1747,161 @@ async def api_prev_image(dataset_name: str, current_image: str):
                      return {"status": "ok", "prev": images[-1]}
                 break
     return {"status": "none"}
+
+
+def _list_datasets() -> List[str]:
+    out = []
+    if DATASETS_DIR.exists():
+        for item in sorted(DATASETS_DIR.iterdir()):
+            if item.is_dir() and (item / "data.yaml").exists():
+                out.append(item.name)
+    return out
+
+
+def _normalized_label_signature(label_path: Path) -> Optional[str]:
+    """Order-independent fingerprint of a YOLO label file.
+
+    Polygons that were re-ordered (e.g. by an editor that re-sorts on save)
+    but otherwise identical should compare equal. Returns None if the file
+    doesn't exist; empty string for an empty file.
+    """
+    if not label_path.exists():
+        return None
+    try:
+        with open(label_path, "r", encoding="utf-8") as f:
+            lines = [" ".join(line.strip().split()) for line in f if line.strip()]
+    except Exception:
+        return None
+    lines.sort()
+    return "\n".join(lines)
+
+
+def _index_dataset_images(dataset_name: str) -> dict:
+    """Map image stem -> {split, image_filename, label_signature}.
+
+    With hash-based filenames, identical image content shares the same stem
+    across datasets, so stem is the right join key for "is this the same
+    image?" comparisons.
+    """
+    by_stem = {}
+    for split in ALL_SPLITS:
+        images_dir = DATASETS_DIR / dataset_name / split / "images"
+        labels_dir = DATASETS_DIR / dataset_name / split / "labels"
+        if not images_dir.exists():
+            continue
+        for img_file in images_dir.glob("*.*"):
+            if img_file.suffix.lower() not in IMAGE_EXTS:
+                continue
+            lbl_file = labels_dir / (img_file.stem + ".txt")
+            by_stem[img_file.stem] = {
+                "split": split,
+                "image_filename": img_file.name,
+                "label_filename": lbl_file.name,
+                "has_label": lbl_file.exists(),
+                "label_signature": _normalized_label_signature(lbl_file),
+            }
+    return by_stem
+
+
+@app.get("/compare", response_class=HTMLResponse)
+async def read_compare(request: Request, a: Optional[str] = None, b: Optional[str] = None):
+    return templates.TemplateResponse(
+        request=request, name="compare.html", context={
+            "datasets": _list_datasets(),
+            "preselect_a": a or "",
+            "preselect_b": b or "",
+        }
+    )
+
+
+@app.get("/api/compare")
+async def api_compare(dataset_a: str, dataset_b: str):
+    if dataset_a == dataset_b:
+        raise HTTPException(status_code=400, detail="Pick two different datasets")
+
+    for name in (dataset_a, dataset_b):
+        if not get_yaml_path(name).exists():
+            raise HTTPException(status_code=404, detail=f"Dataset not found: {name}")
+
+    a_map = _index_dataset_images(dataset_a)
+    b_map = _index_dataset_images(dataset_b)
+
+    a_stems = set(a_map.keys())
+    b_stems = set(b_map.keys())
+
+    only_a_stems = sorted(a_stems - b_stems)
+    only_b_stems = sorted(b_stems - a_stems)
+    common_stems = a_stems & b_stems
+
+    def entry(dataset_name: str, stem: str, info: dict) -> dict:
+        return {
+            "stem": stem,
+            "dataset": dataset_name,
+            "split": info["split"],
+            "image_url": f"/datasets/{dataset_name}/{info['split']}/images/{info['image_filename']}",
+            "label_url": f"/datasets/{dataset_name}/{info['split']}/labels/{info['label_filename']}",
+            "has_label": info["has_label"],
+        }
+
+    label_diff = []
+    for stem in sorted(common_stems):
+        ia = a_map[stem]
+        ib = b_map[stem]
+        if ia["label_signature"] == ib["label_signature"]:
+            continue
+        label_diff.append({
+            "stem": stem,
+            "a": entry(dataset_a, stem, ia),
+            "b": entry(dataset_b, stem, ib),
+            "a_has_label": ia["has_label"],
+            "b_has_label": ib["has_label"],
+        })
+
+    only_a = [entry(dataset_a, s, a_map[s]) for s in only_a_stems]
+    only_b = [entry(dataset_b, s, b_map[s]) for s in only_b_stems]
+
+    # Class definition diff from data.yaml
+    def load_classes(name: str) -> List[str]:
+        try:
+            with open(get_yaml_path(name), "r", encoding="utf-8") as f:
+                return (yaml.safe_load(f) or {}).get("names", []) or []
+        except Exception:
+            return []
+    classes_a = load_classes(dataset_a)
+    classes_b = load_classes(dataset_b)
+
+    return {
+        "status": "ok",
+        "dataset_a": dataset_a,
+        "dataset_b": dataset_b,
+        "classes_a": classes_a,
+        "classes_b": classes_b,
+        "counts": {
+            "a_total": len(a_map),
+            "b_total": len(b_map),
+            "common": len(common_stems),
+            "only_a": len(only_a),
+            "only_b": len(only_b),
+            "label_diff": len(label_diff),
+        },
+        "only_a": only_a,
+        "only_b": only_b,
+        "label_diff": label_diff,
+    }
+
+
+# Optional, gitignored local customizations. The contract is that the
+# module defines `register(app, datasets_dir)` and adds whatever routes
+# the user needs. Public repo stays clean of personal endpoints/secrets.
+HOOKS_LOCAL_ENABLED = False
+try:
+    import hooks_local  # type: ignore
+    if hasattr(hooks_local, "register"):
+        hooks_local.register(app, datasets_dir=DATASETS_DIR)
+        HOOKS_LOCAL_ENABLED = True
+except ImportError:
+    pass
+except Exception as e:
+    print(f"hooks_local failed to initialize: {e}")
 
 

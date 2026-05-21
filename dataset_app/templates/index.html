@@ -8,6 +8,16 @@
             <p class="text-slate-400">Select a dataset to view or edit segmentation labels.</p>
         </div>
         <div class="flex gap-3">
+            <a href="/compare"
+                class="bg-slate-700 hover:bg-slate-600 text-white px-4 py-2 font-medium rounded-lg transition-colors flex items-center gap-2 shadow-lg shadow-slate-900/20 border border-slate-600"
+                title="Compare two datasets and see file/label differences">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24"
+                    stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                        d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
+                </svg>
+                Compare
+            </a>
             <button id="clip-all-btn" onclick="submitClipAll()"
                 class="bg-slate-700 hover:bg-slate-600 disabled:opacity-60 text-white px-4 py-2 font-medium rounded-lg transition-colors flex items-center gap-2 shadow-lg shadow-slate-900/20 border border-slate-600"
                 title="Sutherland-Hodgman polygon clipping across every dataset under datasets/">

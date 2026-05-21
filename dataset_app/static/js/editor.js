@@ -148,6 +148,161 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     }
 
+    const shrinkBtn = document.getElementById('shrink-btn');
+    const shrinkPercentInput = document.getElementById('shrink-percent');
+    const shrinkError = document.getElementById('shrink-error');
+
+    if (shrinkPercentInput) {
+        const savedShrink = localStorage.getItem('dataset_editor_shrink_percent');
+        if (savedShrink !== null) shrinkPercentInput.value = savedShrink;
+        shrinkPercentInput.addEventListener('change', () => {
+            localStorage.setItem('dataset_editor_shrink_percent', shrinkPercentInput.value);
+        });
+    }
+
+    if (shrinkBtn) {
+        shrinkBtn.addEventListener('click', async () => {
+            shrinkError.classList.add('hidden');
+            const pct = parseFloat(shrinkPercentInput.value);
+            if (!(pct > 0)) {
+                shrinkError.textContent = 'Enter a positive percent.';
+                shrinkError.classList.remove('hidden');
+                return;
+            }
+            if (polygons.length === 0) {
+                shrinkError.textContent = 'No polygons to shrink.';
+                shrinkError.classList.remove('hidden');
+                return;
+            }
+
+            const indices = selectedPolygonIndex >= 0 ? [selectedPolygonIndex] : null;
+
+            shrinkBtn.disabled = true;
+            try {
+                const payload = {
+                    polygons: polygons.map(p => ({
+                        classId: p.classId,
+                        points: p.points.map(pt => ({ x: pt.x, y: pt.y }))
+                    })),
+                    shrink_percent: pct,
+                    indices: indices
+                };
+                const resp = await fetch('/api/shrink_polygons', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                if (!resp.ok) {
+                    const errDetail = await resp.json().catch(() => ({}));
+                    shrinkError.textContent = 'Error: ' + (errDetail.detail || resp.statusText);
+                    shrinkError.classList.remove('hidden');
+                    return;
+                }
+                const data = await resp.json();
+                const newPolys = [];
+                let selectedSurvived = false;
+                let newSelectedIndex = -1;
+                data.polygons.forEach((p, i) => {
+                    if (p.points && p.points.length >= 3) {
+                        if (i === selectedPolygonIndex) {
+                            selectedSurvived = true;
+                            newSelectedIndex = newPolys.length;
+                        }
+                        newPolys.push({ classId: p.classId, points: p.points });
+                    }
+                });
+                polygons = newPolys;
+                selectedPolygonIndex = selectedSurvived ? newSelectedIndex : -1;
+                saveHistory();
+                draw();
+            } catch (e) {
+                console.error(e);
+                shrinkError.textContent = 'Network error.';
+                shrinkError.classList.remove('hidden');
+            } finally {
+                shrinkBtn.disabled = false;
+            }
+        });
+    }
+
+    const snapBtn = document.getElementById('snap-btn');
+    const snapIterInput = document.getElementById('snap-iter');
+    const snapMarginInput = document.getElementById('snap-margin');
+    const snapSmoothInput = document.getElementById('snap-smooth');
+    const snapError = document.getElementById('snap-error');
+
+    [['snap-iter', 'dataset_editor_snap_iter'], ['snap-margin', 'dataset_editor_snap_margin'], ['snap-smooth', 'dataset_editor_snap_smooth']].forEach(([id, key]) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const saved = localStorage.getItem(key);
+        if (saved !== null) el.value = saved;
+        el.addEventListener('change', () => localStorage.setItem(key, el.value));
+    });
+
+    if (snapBtn) {
+        snapBtn.addEventListener('click', async () => {
+            snapError.classList.add('hidden');
+            if (polygons.length === 0) {
+                snapError.textContent = 'No polygons to snap.';
+                snapError.classList.remove('hidden');
+                return;
+            }
+
+            const indices = selectedPolygonIndex >= 0 ? [selectedPolygonIndex] : null;
+            const iterations = parseInt(snapIterInput.value, 10);
+            const margin = parseInt(snapMarginInput.value, 10);
+            const smooth = parseFloat(snapSmoothInput.value);
+
+            snapBtn.disabled = true;
+            const origText = snapBtn.textContent;
+            snapBtn.textContent = 'Snapping...';
+            try {
+                const payload = {
+                    image_path: window.IMAGE_URL,
+                    polygons: polygons.map(p => ({
+                        classId: p.classId,
+                        points: p.points.map(pt => ({ x: pt.x, y: pt.y }))
+                    })),
+                    indices: indices,
+                    iterations: iterations,
+                    margin_px: margin,
+                    smooth_px: isNaN(smooth) ? 0.8 : smooth
+                };
+                const resp = await fetch('/api/snap_polygons', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                if (!resp.ok) {
+                    const errDetail = await resp.json().catch(() => ({}));
+                    snapError.textContent = 'Error: ' + (errDetail.detail || resp.statusText);
+                    snapError.classList.remove('hidden');
+                    return;
+                }
+                const data = await resp.json();
+                const newPolys = [];
+                let newSelectedIndex = -1;
+                data.polygons.forEach((p, i) => {
+                    if (p.points && p.points.length >= 3) {
+                        if (i === selectedPolygonIndex) newSelectedIndex = newPolys.length;
+                        newPolys.push({ classId: p.classId, points: p.points });
+                    }
+                });
+                polygons = newPolys;
+                selectedPolygonIndex = newSelectedIndex;
+                saveHistory();
+                draw();
+            } catch (e) {
+                console.error(e);
+                snapError.textContent = 'Network error.';
+                snapError.classList.remove('hidden');
+            } finally {
+                snapBtn.disabled = false;
+                snapBtn.textContent = origText;
+            }
+        });
+    }
+
     if (autoSegmentBtn) {
         autoSegmentBtn.addEventListener('click', async () => {
             const modelName = modelSelector.value;
@@ -528,6 +683,25 @@ document.addEventListener("DOMContentLoaded", () => {
             });
 
             if (resp.ok) {
+                // Saving non-empty labels means the image is no longer a
+                // "no detection target" image — clear the negative flag so
+                // the data is consistent.
+                const negChkEl = document.getElementById('negative-sample-chk');
+                if (negChkEl && negChkEl.checked && normalizedPolygons.length > 0) {
+                    try {
+                        const filename = (window.IMAGE_URL || '').split('?')[0].split('/').pop();
+                        if (filename) {
+                            await fetch(`/api/dataset/${encodeURIComponent(window.DATASET_NAME)}/toggle_negative`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ image_filename: decodeURIComponent(filename), value: false })
+                            });
+                            negChkEl.checked = false;
+                            const ns = document.getElementById('negative-sample-status');
+                            if (ns) ns.classList.add('hidden');
+                        }
+                    } catch (_) { /* non-fatal */ }
+                }
                 btn.classList.remove('bg-indigo-600', 'bg-emerald-600');
                 btn.classList.add('bg-emerald-600');
                 btn.innerText = "Saved!";
@@ -671,6 +845,95 @@ document.addEventListener("DOMContentLoaded", () => {
             deleteImgBtn.disabled = false;
         }
     });
+
+    // --- Negative Sample Toggle ---
+    // Per-image flag stored at datasets/<name>/negative_samples.json (outside
+    // train/valid/test). Marking an image as a negative sample says "I am
+    // deliberately leaving this empty", which lets the gallery's "Unlabeled
+    // (needs work)" filter exclude it, and Save&Next skip it.
+    const negChk = document.getElementById('negative-sample-chk');
+    const negStatus = document.getElementById('negative-sample-status');
+
+    function imageFilenameFromUrl(url) {
+        try {
+            const path = url.split('?')[0];
+            const idx = path.lastIndexOf('/');
+            return idx >= 0 ? decodeURIComponent(path.slice(idx + 1)) : decodeURIComponent(path);
+        } catch (e) {
+            return null;
+        }
+    }
+    const currentImageFilename = imageFilenameFromUrl(window.IMAGE_URL);
+
+    function setNegativeUI(isNegative) {
+        if (!negChk) return;
+        negChk.checked = !!isNegative;
+        if (negStatus) negStatus.classList.toggle('hidden', !isNegative);
+    }
+
+    async function fetchNegativeState() {
+        if (!negChk || !currentImageFilename) return;
+        try {
+            const resp = await fetch(`/api/dataset/${encodeURIComponent(window.DATASET_NAME)}/negative_samples`);
+            if (!resp.ok) return;
+            const data = await resp.json();
+            setNegativeUI((data.items || []).includes(currentImageFilename));
+        } catch (e) {
+            console.error('Failed to fetch negative-sample state', e);
+        }
+    }
+
+    async function postNegativeToggle(value) {
+        const resp = await fetch(`/api/dataset/${encodeURIComponent(window.DATASET_NAME)}/toggle_negative`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image_filename: currentImageFilename, value })
+        });
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            throw new Error(err.detail || 'Toggle failed');
+        }
+    }
+
+    if (negChk && currentImageFilename) {
+        negChk.addEventListener('change', async () => {
+            const wantOn = negChk.checked;
+            const hadPolygons = polygons.length > 0;
+            if (wantOn && hadPolygons) {
+                const ok = confirm("Mark as negative sample?\n\nThis will clear all existing polygons on this image. Proceed?");
+                if (!ok) {
+                    negChk.checked = false;
+                    return;
+                }
+                polygons = [];
+                draw();
+                saveHistory();
+                // Persist the empty label so the file system reflects "no labels"
+                // immediately; otherwise the gallery would still show the old
+                // labels until the user hits Save.
+                try {
+                    await fetch('/api/save_labels', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            dataset_name: window.DATASET_NAME,
+                            label_path: window.LABEL_URL,
+                            polygons: []
+                        })
+                    });
+                } catch (_) { /* non-fatal; user can hit Save later */ }
+            }
+            try {
+                await postNegativeToggle(wantOn);
+                setNegativeUI(wantOn);
+            } catch (e) {
+                console.error(e);
+                alert('Failed to update negative-sample flag.');
+                negChk.checked = !wantOn;
+            }
+        });
+        fetchNegativeState();
+    }
 
     // Coordinate Conversion (returns coordinates in image-pixel space, which is
     // also the polygon coordinate space; independent of RESOLUTION_MULTIPLIER).
