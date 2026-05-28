@@ -1128,6 +1128,14 @@ document.addEventListener("DOMContentLoaded", () => {
         } else if (e.key === 'y' && (e.ctrlKey || e.metaKey)) {
             redo();
             e.preventDefault();
+        } else if (e.key === 'n' || e.key === 'N') {
+            const activeTag = document.activeElement ? document.activeElement.tagName.toLowerCase() : '';
+            if (activeTag !== 'input' && activeTag !== 'textarea') {
+                if (negChk) {
+                    negChk.click();
+                    e.preventDefault();
+                }
+            }
         }
     });
 
