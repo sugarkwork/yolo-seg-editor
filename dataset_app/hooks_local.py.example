@@ -1,0 +1,6 @@
+"""Local hook activation template.
+
+Copy this file to hooks_local.py to enable the archive/upload extension.
+Credentials are read from dataset_app/.env by hooks_share_upload.py.
+"""
+from hooks_share_upload import register

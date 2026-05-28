@@ -454,7 +454,7 @@ class AutoSegmentRequest(BaseModel):
     sw: int = 21
 
 @app.post("/api/auto_segment")
-async def api_auto_segment(req: AutoSegmentRequest):
+def api_auto_segment(req: AutoSegmentRequest):
     model_path = MODELS_DIR / req.model_name
     if not model_path.exists():
         raise HTTPException(status_code=404, detail="Model not found")
@@ -700,7 +700,7 @@ class AutoCheckRequest(BaseModel):
     model_name: str
 
 @app.post("/api/dataset/{dataset_name}/auto_check")
-async def api_auto_check(dataset_name: str, req: AutoCheckRequest):
+def api_auto_check(dataset_name: str, req: AutoCheckRequest):
     model_path = MODELS_DIR / req.model_name
     if not model_path.exists():
         raise HTTPException(status_code=404, detail="Model not found")
@@ -778,7 +778,7 @@ class AutoCheckSingleRequest(BaseModel):
     sw: int = 21
     
 @app.post("/api/dataset/{dataset_name}/auto_check_single")
-async def api_auto_check_single(dataset_name: str, req: AutoCheckSingleRequest):
+def api_auto_check_single(dataset_name: str, req: AutoCheckSingleRequest):
     model_path = MODELS_DIR / req.model_name
     if not model_path.exists():
         raise HTTPException(status_code=404, detail="Model not found")
@@ -866,7 +866,7 @@ class BenchmarkRequest(BaseModel):
     critical_classes: List[str] = ["penis", "pussy"]
 
 @app.post("/api/dataset/{dataset_name}/benchmark")
-async def api_benchmark(dataset_name: str, req: BenchmarkRequest):
+def api_benchmark(dataset_name: str, req: BenchmarkRequest):
     if not req.model_names:
         raise HTTPException(status_code=400, detail="No models specified")
 
@@ -1142,7 +1142,7 @@ class AutoSplitRequest(BaseModel):
     test_ratio: float = 0.1
 
 @app.post("/api/dataset/{dataset_name}/auto_split")
-async def api_auto_split(dataset_name: str, req: AutoSplitRequest):
+def api_auto_split(dataset_name: str, req: AutoSplitRequest):
     # validate ratios
     total = req.train_ratio + req.valid_ratio + req.test_ratio
     if abs(total - 1.0) > 0.01:

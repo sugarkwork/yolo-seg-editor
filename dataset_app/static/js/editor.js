@@ -518,9 +518,9 @@ document.addEventListener("DOMContentLoaded", () => {
                     const newIndex = data.classes.length - 1;
 
                     const btn = document.createElement('button');
-                    btn.className = 'class-selector w-full text-left px-3 py-2 rounded text-sm transition-colors flex items-center gap-3 bg-slate-800/50 text-slate-300 border border-transparent';
+                    btn.className = 'class-selector w-full flex items-center gap-2 p-2 rounded text-left transition-colors bg-slate-800/50 hover:bg-slate-700 text-slate-300 border border-transparent';
                     btn.dataset.classId = newIndex;
-                    btn.innerHTML = `<span class="w-2.5 h-2.5 rounded-sm shadow-sm" style="background-color: ${getClassColor(newIndex)}"></span>${className}`;
+                    btn.innerHTML = `<div class="w-3 h-3 rounded-sm class-color-indicator" style="background-color: ${getClassColor(newIndex)}"></div><span class="text-sm truncate font-medium">${className}</span>`;
 
                     btn.addEventListener('click', () => {
                         document.querySelectorAll('.class-selector').forEach(b => {

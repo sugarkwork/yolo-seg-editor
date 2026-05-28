@@ -12,6 +12,25 @@
         touch-action: none;
         overflow: hidden;
     }
+
+    /* Help popover */
+    #help-popover {
+        position: absolute;
+        top: 100%;
+        right: 0;
+        margin-top: 0.5rem;
+        min-width: 260px;
+        z-index: 100;
+        opacity: 0;
+        transform: translateY(-4px);
+        pointer-events: none;
+        transition: opacity 0.15s ease, transform 0.15s ease;
+    }
+    #help-popover.open {
+        opacity: 1;
+        transform: translateY(0);
+        pointer-events: auto;
+    }
 </style>
 <script>
     // Pass data to Javascript
@@ -52,12 +71,50 @@
     </button>
     <button id="save-next-btn"
         class="px-4 py-2 text-sm font-bold bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors shadow-lg shadow-emerald-500/20 flex items-center gap-2">
-        <span>Save & Next</span>
+        <span>Save &amp; Next</span>
         <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 5l7 7-7 7M5 5l7 7-7 7" />
         </svg>
     </button>
+    <!-- Help Button -->
+    <div class="relative">
+        <button id="help-toggle-btn"
+            class="w-9 h-9 flex items-center justify-center rounded-lg bg-slate-800 text-slate-400 hover:text-white hover:bg-slate-700 transition-colors border border-slate-700 text-sm font-bold"
+            title="Controls">
+            ?
+        </button>
+        <div id="help-popover" class="glass-panel p-4 text-xs text-slate-400">
+            <h3 class="font-bold uppercase tracking-wider text-slate-300 mb-2">Controls</h3>
+            <ul class="space-y-1.5 list-disc pl-4">
+                <li><span class="text-indigo-400 font-semibold">Left Click</span>: Add point</li>
+                <li><span class="text-indigo-400 font-semibold">L-Drag Point</span>: Move point</li>
+                <li><span class="text-indigo-400 font-semibold">Right Click</span>: Close poly / Del point</li>
+                <li><span class="text-indigo-400 font-semibold">Wheel</span>: Zoom In/Out</li>
+                <li><span class="text-indigo-400 font-semibold">Middle Drag</span>: Pan Canvas</li>
+                <li><span class="text-indigo-400 font-semibold">Ctrl+Z / Ctrl+Y</span>: Undo / Redo</li>
+                <li><span class="text-rose-400 font-semibold">Delete/Bksp</span>: Delete obj / point</li>
+                <li><span class="text-indigo-400 font-semibold">Esc</span>: Cancel drawing</li>
+            </ul>
+        </div>
+    </div>
 </div>
+<script>
+    document.addEventListener('DOMContentLoaded', () => {
+        const helpBtn = document.getElementById('help-toggle-btn');
+        const helpPop = document.getElementById('help-popover');
+        if (helpBtn && helpPop) {
+            helpBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                helpPop.classList.toggle('open');
+            });
+            document.addEventListener('click', (e) => {
+                if (!helpPop.contains(e.target) && e.target !== helpBtn) {
+                    helpPop.classList.remove('open');
+                }
+            });
+        }
+    });
+</script>
 {% endblock %}
 
 {% block content %}
@@ -71,7 +128,7 @@
                 ACTIVE CLASS
             </h3>
 
-            <div id="class-list-container" class="space-y-2">
+            <div id="class-list-container" class="space-y-2 flex-1 min-h-0 overflow-y-auto">
                 {% for name in classes %}
                 <button
                     class="class-selector w-full flex items-center gap-2 p-2 rounded text-left transition-colors {% if loop.index0 == 0 %}bg-indigo-500/20 border border-indigo-500/50 text-indigo-300{% else %}bg-slate-800/50 hover:bg-slate-700 text-slate-300 border border-transparent{% endif %}"
@@ -229,21 +286,6 @@
             </label>
             <p class="text-[10px] text-slate-400 leading-tight">Hides this image from the "Unlabeled (needs work)" filter and skips it in Save&amp;Next.</p>
             <p id="negative-sample-status" class="text-[10px] text-sky-300 hidden">Marked as negative sample.</p>
-        </div>
-
-        <!-- Instructions Panel -->
-        <div class="glass-panel p-4 text-xs text-slate-400">
-            <h3 class="font-bold uppercase tracking-wider text-slate-300 mb-2">Controls</h3>
-            <ul class="space-y-1.5 list-disc pl-4">
-                <li><span class="text-indigo-400 font-semibold">Left Click</span>: Add point</li>
-                <li><span class="text-indigo-400 font-semibold">L-Drag Point</span>: Move point</li>
-                <li><span class="text-indigo-400 font-semibold">Right Click</span>: Close poly / Del point</li>
-                <li><span class="text-indigo-400 font-semibold">Wheel</span>: Zoom In/Out</li>
-                <li><span class="text-indigo-400 font-semibold">Middle Drag</span>: Pan Canvas</li>
-                <li><span class="text-indigo-400 font-semibold">Ctrl+Z / Ctrl+Y</span>: Undo / Redo</li>
-                <li><span class="text-rose-400 font-semibold">Delete/Bksp</span>: Delete obj / point</li>
-                <li><span class="text-indigo-400 font-semibold">Esc</span>: Cancel drawing</li>
-            </ul>
         </div>
 
         <!-- Danger Zone -->
