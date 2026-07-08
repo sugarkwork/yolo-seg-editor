@@ -7,3 +7,10 @@ python-dotenv
 requests
 pyyaml
 ultralytics
+onnxruntime-gpu>=1.20,<2 ; sys_platform != "darwin"
+onnxruntime>=1.20,<2 ; sys_platform == "darwin"
+nvidia-cudnn-cu12>=9.0,<10 ; sys_platform != "darwin"
+nvidia-cuda-runtime-cu12 ; sys_platform != "darwin"
+nvidia-cublas-cu12 ; sys_platform != "darwin"
+nvidia-cufft-cu12 ; sys_platform != "darwin"
+Pillow>=10

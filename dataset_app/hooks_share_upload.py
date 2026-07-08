@@ -7,10 +7,12 @@ import os
 import shutil
 import subprocess
 import tempfile
+import json
 from pathlib import Path
+from typing import Optional
 from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 
 _ENV_PATH = Path(__file__).parent / ".env"
 
@@ -42,13 +44,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _find_7zip() -> str:
+def _find_7zip() -> Optional[str]:
     configured = os.environ.get("UPLOAD_7ZIP_PATH", "").strip()
     if configured:
         configured_path = Path(configured)
         if configured_path.exists():
             return str(configured_path)
-        raise HTTPException(status_code=500, detail=f"7-Zip not found: {configured}")
+        # If configured path doesn't exist, don't fail immediately. Fallback to auto-detection.
 
     for name in ("7z", "7zz", "7za"):
         exe = shutil.which(name)
@@ -65,44 +67,52 @@ def _find_7zip() -> str:
         if candidate.exists():
             return str(candidate)
 
-    raise HTTPException(
-        status_code=500,
-        detail="7-Zip executable not found. Install 7-Zip or set UPLOAD_7ZIP_PATH in .env.",
-    )
+    return None
 
 
-def _create_7z_archive(dataset_dir: Path, archive_path: Path) -> None:
+def _create_archive(dataset_dir: Path, archive_path: Path) -> str:
+    """Create an archive. Try 7z first; fallback to zip using Python standard zipfile if 7z is missing."""
     exe = _find_7zip()
-    timeout = int(os.environ.get("UPLOAD_ARCHIVE_TIMEOUT_SECONDS", "3600"))
-    dict_size = os.environ.get("UPLOAD_7ZIP_DICT_SIZE", "256m").strip() or "256m"
-    cmd = [
-        exe,
-        "a",
-        "-t7z",
-        "-mx=9",
-        "-m0=lzma2",
-        f"-md={dict_size}",
-        "-mfb=273",
-        "-ms=on",
-        "-y",
-        "-bd",
-        str(archive_path),
-        dataset_dir.name,
-    ]
-    try:
-        completed = subprocess.run(
-            cmd,
-            cwd=str(dataset_dir.parent),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="7-Zip archive timed out")
+    if exe:
+        timeout = int(os.environ.get("UPLOAD_ARCHIVE_TIMEOUT_SECONDS", "3600"))
+        dict_size = os.environ.get("UPLOAD_7ZIP_DICT_SIZE", "256m").strip() or "256m"
+        cmd = [
+            exe,
+            "a",
+            "-t7z",
+            "-mx=9",
+            "-m0=lzma2",
+            f"-md={dict_size}",
+            "-mfb=273",
+            "-ms=on",
+            "-y",
+            "-bd",
+            str(archive_path.with_suffix(".7z")),
+            dataset_dir.name,
+        ]
+        try:
+            completed = subprocess.run(
+                cmd,
+                cwd=str(dataset_dir.parent),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            if completed.returncode == 0 and archive_path.with_suffix(".7z").exists():
+                return "7z"
+        except Exception:
+            pass # fallback to zip
 
-    if completed.returncode != 0 or not archive_path.exists():
-        output = (completed.stderr or completed.stdout or "").strip()
-        raise HTTPException(status_code=500, detail=f"7-Zip failed: {output[:500]}")
+    # ZIP Fallback using Python standard library (no external dependency, fully cross-platform)
+    import zipfile
+    zip_path = archive_path.with_suffix(".zip")
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for root, dirs, files in os.walk(dataset_dir):
+            for file in files:
+                file_path = Path(root) / file
+                rel_path = Path(dataset_dir.name) / file_path.relative_to(dataset_dir)
+                zipf.write(file_path, rel_path)
+    return "zip"
 
 
 def _upload_base_url() -> str:
@@ -152,7 +162,7 @@ def _absolute_url(base_url: str, url):
     return f"{base_url}/{url}"
 
 
-def _upload_to_share_server(archive_path: Path, filename: str) -> dict:
+def _upload_to_share_server(archive_path: Path, filename: str, content_type: str) -> dict:
     base_url = _upload_base_url()
     if not base_url:
         raise HTTPException(status_code=500, detail="UPLOAD_BASE_URL not configured in .env")
@@ -166,7 +176,6 @@ def _upload_to_share_server(archive_path: Path, filename: str) -> dict:
         )
 
     public = _env_bool("UPLOAD_PUBLIC", True)
-    content_type = "application/x-7z-compressed"
     archive_size = archive_path.stat().st_size
     headers = _auth_headers()
 
@@ -226,30 +235,99 @@ def _upload_to_share_server(archive_path: Path, filename: str) -> dict:
     }
 
 
-def register(app: FastAPI, datasets_dir: Path):
-    @app.post("/api/dataset/{dataset_name}/archive_upload")
-    def api_archive_upload(dataset_name: str):
-        ds_dir = datasets_dir / dataset_name
-        if not ds_dir.exists() or not ds_dir.is_dir():
-            raise HTTPException(status_code=404, detail="Dataset not found")
+def bg_archive_upload(dataset_name: str, ds_dir: Path, datasets_dir: Path, status_file: Path):
+    try:
+        # 1. Compressing Phase
+        with open(status_file, "w", encoding="utf-8") as f:
+            json.dump({"status": "compressing", "progress": 0.0}, f)
 
         filename = f"{dataset_name}.7z"
         with tempfile.TemporaryDirectory(prefix="dataset_archive_", dir=datasets_dir) as tmpdir:
-            archive_path = Path(tmpdir) / filename
-            _create_7z_archive(ds_dir, archive_path)
+            base_archive_path = Path(tmpdir) / dataset_name
+            fmt = _create_archive(ds_dir, base_archive_path)
+            
+            if fmt == "7z":
+                archive_path = base_archive_path.with_suffix(".7z")
+                filename = f"{dataset_name}.7z"
+                content_type = "application/x-7z-compressed"
+            else:
+                archive_path = base_archive_path.with_suffix(".zip")
+                filename = f"{dataset_name}.zip"
+                content_type = "application/zip"
+                
             archive_size = archive_path.stat().st_size
-            upload_result = _upload_to_share_server(archive_path, filename)
-
-        return {
-            "status": "ok",
-            "dataset": dataset_name,
+            
+            # 2. Uploading Phase
+            with open(status_file, "w", encoding="utf-8") as f:
+                json.dump({"status": "uploading", "progress": 0.5, "filename": filename, "format": fmt}, f)
+                
+            upload_result = _upload_to_share_server(archive_path, filename, content_type)
+            
+        # 3. Complete Phase
+        payload = {
+            "status": "complete",
+            "progress": 1.0,
             "archive_filename": filename,
-            "archive_format": "7z",
+            "archive_format": fmt,
             "bytes_uploaded": archive_size,
             "file_id": upload_result["file_id"],
             "download_url": upload_result["download_url"],
             "url": upload_result["download_url"],
             "public": upload_result["public"],
             "upload_state": upload_result["upload_response"].get("state"),
-            "upload_response_status": 200,
         }
+        with open(status_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+        # Print the link loudly in the console so it's impossible to lose
+        print("\n" + "="*80)
+        print(f"[UPLOAD SUCCESS] Dataset '{dataset_name}' archived and uploaded successfully!")
+        print(f"File Name:     {filename}")
+        print(f"Download URL:  {upload_result['download_url']}")
+        print("="*80 + "\n", flush=True)
+            
+    except Exception as e:
+        import traceback
+        err_msg = str(e)
+        print(f"\n[UPLOAD ERROR] Failed to upload dataset '{dataset_name}': {err_msg}", flush=True)
+        traceback.print_exc()
+        try:
+            with open(status_file, "w", encoding="utf-8") as f:
+                json.dump({"status": "error", "error_msg": err_msg}, f)
+        except Exception:
+            pass
+
+
+def register(app: FastAPI, datasets_dir: Path):
+    @app.post("/api/dataset/{dataset_name}/archive_upload")
+    def api_archive_upload(dataset_name: str, bg_tasks: BackgroundTasks):
+        ds_dir = datasets_dir / dataset_name
+        if not ds_dir.exists() or not ds_dir.is_dir():
+            raise HTTPException(status_code=404, detail="Dataset not found")
+
+        status_file = datasets_dir / dataset_name / "upload_status.json"
+        
+        # Avoid duplicate runs if already compressing or uploading
+        if status_file.exists():
+            try:
+                with open(status_file, "r", encoding="utf-8") as f:
+                    curr = json.load(f)
+                    if curr.get("status") in ("compressing", "uploading"):
+                        return {"status": "running", "msg": "Already running"}
+            except Exception:
+                pass
+
+        # Start non-blocking background task
+        bg_tasks.add_task(bg_archive_upload, dataset_name, ds_dir, datasets_dir, status_file)
+        return {"status": "started"}
+
+    @app.get("/api/dataset/{dataset_name}/upload_status")
+    def api_upload_status(dataset_name: str):
+        status_file = datasets_dir / dataset_name / "upload_status.json"
+        if not status_file.exists():
+            return {"status": "idle"}
+        try:
+            with open(status_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            return {"status": "error", "error_msg": str(e)}

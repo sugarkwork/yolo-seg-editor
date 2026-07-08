@@ -9,7 +9,14 @@ import random
 import json
 import hashlib
 import re
+import time
+import gc
+import threading
+import urllib.parse
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import List, Optional
 
 HASH_STEM_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -20,6 +27,7 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 TRAINING_SPLITS = ["train", "valid", "test", "val"]
 PENDING_SPLIT = "pending"
 ALL_SPLITS = TRAINING_SPLITS + [PENDING_SPLIT]
+MULTIPOLYGON_LABEL_DIR = "cocolabels"
 
 def compute_image_hash(path: Path) -> str:
     h = hashlib.sha1()
@@ -28,6 +36,7 @@ def compute_image_hash(path: Path) -> str:
             h.update(chunk)
     return h.hexdigest()[:16]
 from config import DATASETS_DIR, BASE_DIR, MODELS_DIR
+from tag_search import TagSearchDatabase, split_tags, tag_missing_images
 
 app = FastAPI(title="YOLO Segmentation Dataset Editor")
 
@@ -42,6 +51,250 @@ templates = Jinja2Templates(directory="templates")
 
 def get_yaml_path(dataset_name: str) -> Path:
     return DATASETS_DIR / dataset_name / "data.yaml"
+
+def current_dataset_image_items(dataset_name: str):
+    items = []
+    for split in ALL_SPLITS:
+        images_dir = DATASETS_DIR / dataset_name / split / "images"
+        if not images_dir.exists():
+            continue
+        for img_file in sorted(images_dir.glob("*.*")):
+            if img_file.suffix.lower() in IMAGE_EXTS:
+                items.append((split, img_file))
+    return items
+
+def resolve_yolo_device(torch_module):
+    configured = (
+        os.environ.get("AUTO_SEGMENT_DEVICE", "").strip()
+        or os.environ.get("YOLO_DEVICE", "").strip()
+    )
+    if configured:
+        return int(configured) if configured.isdigit() else configured
+    return 0 if torch_module.cuda.is_available() else "cpu"
+
+def yolo_uses_cuda(torch_module, device) -> bool:
+    if not torch_module.cuda.is_available():
+        return False
+    if isinstance(device, int):
+        return True
+    return str(device).lower() not in {"cpu", "mps"}
+
+def log_yolo_device(torch_module, device, context: str) -> None:
+    if yolo_uses_cuda(torch_module, device):
+        index = device if isinstance(device, int) else 0
+        if isinstance(device, str) and ":" in device:
+            try:
+                index = int(device.rsplit(":", 1)[1])
+            except ValueError:
+                index = 0
+        try:
+            name = torch_module.cuda.get_device_name(index)
+        except Exception:
+            name = "CUDA"
+        print(f"[inference] {context} using GPU device={device} ({name})", flush=True)
+    else:
+        print(f"[inference] {context} using CPU device={device}", flush=True)
+
+def _coerce_yolo_imgsz(value, default: int = 640):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        size = int(value)
+        return size if size >= 32 else None
+    if isinstance(value, str):
+        nums = [int(x) for x in re.findall(r"\d+", value)]
+        if not nums:
+            return None
+        return nums[0] if len(nums) == 1 or nums[0] == nums[1] else nums[:2]
+    if isinstance(value, (list, tuple)):
+        sizes = []
+        for item in value:
+            coerced = _coerce_yolo_imgsz(item, default)
+            if isinstance(coerced, int):
+                sizes.append(coerced)
+            elif isinstance(coerced, list):
+                sizes.extend(coerced)
+        sizes = [s for s in sizes if s >= 32]
+        if not sizes:
+            return None
+        return sizes[0] if len(sizes) == 1 or sizes[0] == sizes[1] else sizes[:2]
+    return None
+
+def _get_arg_value(args, key: str):
+    if isinstance(args, dict):
+        return args.get(key)
+    return getattr(args, key, None)
+
+def resolve_yolo_model_imgsz(model, default: int = 640):
+    """Read the training image size stored in an Ultralytics model checkpoint."""
+    sources = [
+        getattr(getattr(model, "model", None), "args", None),
+        getattr(model, "overrides", None),
+        getattr(model, "args", None),
+    ]
+    ckpt = getattr(model, "ckpt", None)
+    if isinstance(ckpt, dict):
+        sources.append(ckpt.get("train_args"))
+
+    for args in sources:
+        imgsz = _coerce_yolo_imgsz(_get_arg_value(args, "imgsz"), default)
+        if imgsz is not None:
+            return imgsz
+    return default
+
+def log_yolo_imgsz(model, context: str, default: int = 640):
+    imgsz = resolve_yolo_model_imgsz(model, default)
+    print(f"[inference] {context} using imgsz={imgsz}", flush=True)
+    return imgsz
+
+
+def _resolve_benchmark_batch_size(requested=None) -> int:
+    raw = requested if requested not in (None, "") else os.environ.get("YOLO_BENCHMARK_BATCH", "8")
+    try:
+        return max(1, min(64, int(raw)))
+    except (TypeError, ValueError):
+        return 8
+
+
+def _is_cuda_oom_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "out of memory" in msg or ("cuda" in msg and "memory" in msg)
+
+
+YOLO_MODEL_CACHE = OrderedDict()
+YOLO_MODEL_CACHE_LOCK = threading.Lock()
+
+
+def _yolo_model_cache_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("YOLO_MODEL_CACHE_MAX", "2")))
+    except ValueError:
+        return 2
+
+
+def _yolo_model_cache_key(model_path: Path, device) -> tuple:
+    stat = model_path.stat()
+    return (
+        str(model_path.resolve()),
+        stat.st_mtime_ns,
+        stat.st_size,
+        str(device),
+    )
+
+
+def _get_cached_yolo_model(model_path: Path, device, context: str, yolo_cls):
+    key = _yolo_model_cache_key(model_path, device)
+    model_label = model_path.name
+    with YOLO_MODEL_CACHE_LOCK:
+        entry = YOLO_MODEL_CACHE.get(key)
+        if entry is not None:
+            YOLO_MODEL_CACHE.move_to_end(key)
+            print(
+                f"[inference] {context} using cached model={model_label} imgsz={entry['imgsz']}",
+                flush=True,
+            )
+            return entry["model"], entry["imgsz"], entry["predict_lock"]
+
+        started = time.time()
+        model = yolo_cls(str(model_path))
+        imgsz = resolve_yolo_model_imgsz(model)
+        entry = {
+            "model": model,
+            "imgsz": imgsz,
+            "predict_lock": threading.Lock(),
+            "model_name": model_label,
+        }
+        YOLO_MODEL_CACHE[key] = entry
+        print(
+            f"[inference] {context} loaded model={model_label} imgsz={imgsz} "
+            f"load_sec={time.time() - started:.2f}",
+            flush=True,
+        )
+
+        while len(YOLO_MODEL_CACHE) > _yolo_model_cache_limit():
+            _, evicted = YOLO_MODEL_CACHE.popitem(last=False)
+            print(f"[inference] evicted cached model={evicted.get('model_name')}", flush=True)
+            del evicted
+            gc.collect()
+
+        return entry["model"], entry["imgsz"], entry["predict_lock"]
+
+
+def _clamp01(value) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _prediction_extent_ratio(prediction: dict) -> float:
+    points = prediction.get("points") or []
+    if not points:
+        return 0.0
+    xs = [float(p["x"]) for p in points]
+    ys = [float(p["y"]) for p in points]
+    return max(max(xs) - min(xs), max(ys) - min(ys))
+
+
+def _polygon_iou_ratio(poly_a: dict, poly_b: dict, cv2_module, np_module, size: int = 256) -> float:
+    points_a = poly_a.get("points") or []
+    points_b = poly_b.get("points") or []
+    if len(points_a) < 3 or len(points_b) < 3:
+        return 0.0
+
+    def to_array(points):
+        return np_module.array(
+            [[int(_clamp01(pt["x"]) * (size - 1)), int(_clamp01(pt["y"]) * (size - 1))] for pt in points],
+            dtype=np_module.int32,
+        )
+
+    mask_a = np_module.zeros((size, size), dtype=np_module.uint8)
+    mask_b = np_module.zeros((size, size), dtype=np_module.uint8)
+    cv2_module.fillPoly(mask_a, [to_array(points_a)], 1)
+    cv2_module.fillPoly(mask_b, [to_array(points_b)], 1)
+    union = np_module.logical_or(mask_a, mask_b).sum()
+    if union == 0:
+        return 0.0
+    intersection = np_module.logical_and(mask_a, mask_b).sum()
+    return float(intersection / union)
+
+
+def _merge_padding_predictions(
+    normal_predictions: list,
+    padded_predictions: list,
+    merge_mode: str,
+    large_threshold_ratio: float,
+    match_iou: float,
+    cv2_module,
+    np_module,
+) -> list:
+    mode = merge_mode if merge_mode in {"all", "large_only"} else "large_only"
+    merged = [dict(pred) for pred in normal_predictions]
+    large_normal_indices = {
+        idx for idx, pred in enumerate(normal_predictions)
+        if _prediction_extent_ratio(pred) >= large_threshold_ratio
+    }
+
+    for padded_pred in padded_predictions:
+        is_large_padded = _prediction_extent_ratio(padded_pred) >= large_threshold_ratio
+        best_idx = None
+        best_iou = 0.0
+        for idx, normal_pred in enumerate(merged):
+            if normal_pred.get("classId") != padded_pred.get("classId"):
+                continue
+            iou = _polygon_iou_ratio(normal_pred, padded_pred, cv2_module, np_module)
+            if iou > best_iou:
+                best_iou = iou
+                best_idx = idx
+
+        best_is_large_normal = best_idx in large_normal_indices if best_idx is not None else False
+        should_merge = mode == "all" or is_large_padded or best_is_large_normal
+        if not should_merge:
+            continue
+
+        if best_idx is not None and best_iou >= match_iou:
+            merged[best_idx] = dict(padded_pred)
+        else:
+            merged.append(dict(padded_pred))
+
+    return merged
 
 EDGE_PROXIMITY_THRESHOLD = 0.02
 
@@ -69,24 +322,327 @@ def _polygon_edge_score(coords, threshold: float = EDGE_PROXIMITY_THRESHOLD) -> 
         return 0.0
     return round(1.0 - (min_d_inside / threshold), 4)
 
+
+def _multipolygon_path_for_label(label_path: Path) -> Path:
+    return label_path.parent.parent / MULTIPOLYGON_LABEL_DIR / f"{label_path.stem}.json"
+
+
+def _multipolygon_path_for_image(img_path: Path) -> Path:
+    return img_path.parent.parent / MULTIPOLYGON_LABEL_DIR / f"{img_path.stem}.json"
+
+
+def _point_xy(point):
+    if isinstance(point, dict):
+        return float(point["x"]), float(point["y"])
+    return float(point.x), float(point.y)
+
+
+def _polygon_value(poly, key, default=None):
+    if isinstance(poly, dict):
+        return poly.get(key, default)
+    return getattr(poly, key, default)
+
+
+def _normalize_polygon_dicts(polygons) -> list:
+    normalized = []
+    for idx, poly in enumerate(polygons):
+        class_id = _polygon_value(poly, "classId")
+        label_id = _polygon_value(poly, "labelId") or _polygon_value(poly, "label_id") or f"label-{idx + 1}"
+        points = _polygon_value(poly, "points", [])
+        pts = [{"x": _point_xy(pt)[0], "y": _point_xy(pt)[1]} for pt in points]
+        if len(pts) >= 3:
+            normalized.append({"labelId": str(label_id), "classId": int(class_id), "points": pts})
+    return normalized
+
+
+def _read_yolo_label(label_path: Path) -> list:
+    polygons = []
+    if not label_path.exists():
+        return polygons
+    with open(label_path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            parts = line.strip().split()
+            if len(parts) >= 7 and len(parts) % 2 == 1:
+                class_id = int(parts[0])
+                coords = [float(x) for x in parts[1:]]
+                points = [{"x": coords[i], "y": coords[i + 1]} for i in range(0, len(coords), 2)]
+                label_id = f"label-{line_no}"
+                for piece in _split_zero_width_bridged_points(points):
+                    polygons.append({"labelId": label_id, "classId": class_id, "points": piece})
+    return polygons
+
+
+def _point_key(pt, precision: int = 6) -> tuple:
+    return (round(float(pt["x"]), precision), round(float(pt["y"]), precision))
+
+
+def _polygon_area(points) -> float:
+    if len(points) < 3:
+        return 0.0
+    area = 0.0
+    for i, p in enumerate(points):
+        q = points[(i + 1) % len(points)]
+        area += float(p["x"]) * float(q["y"]) - float(q["x"]) * float(p["y"])
+    return abs(area) * 0.5
+
+
+def _valid_polygon_piece(points) -> bool:
+    return len({_point_key(pt) for pt in points}) >= 3 and _polygon_area(points) > 1e-12
+
+
+def _split_zero_width_bridged_points(points: list) -> list:
+    """Split a self-touching YOLO ring back into multiple polygon islands."""
+    cleaned = []
+    last_key = None
+    for pt in points:
+        key = _point_key(pt)
+        if key == last_key:
+            continue
+        cleaned.append({"x": float(pt["x"]), "y": float(pt["y"])})
+        last_key = key
+    if len(cleaned) >= 2 and _point_key(cleaned[0]) == _point_key(cleaned[-1]):
+        cleaned = cleaned[:-1]
+
+    stack = []
+    index_by_key = {}
+    pieces = []
+
+    for pt in cleaned:
+        key = _point_key(pt)
+        if key in index_by_key:
+            start = index_by_key[key]
+            cycle = stack[start:]
+            if _valid_polygon_piece(cycle):
+                pieces.append(cycle)
+            stack = stack[:start + 1]
+            index_by_key = {_point_key(p): i for i, p in enumerate(stack)}
+            continue
+        index_by_key[key] = len(stack)
+        stack.append(pt)
+
+    if pieces:
+        return pieces
+    return [cleaned] if _valid_polygon_piece(cleaned) else []
+
+
+def _read_multipolygon_label(coco_path: Path) -> list:
+    """Read the app's per-image COCO-style multipolygon JSON."""
+    if not coco_path.exists():
+        return []
+    with open(coco_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    polygons = []
+    for ann_idx, ann in enumerate(data.get("annotations", []), start=1):
+        label_id = str(ann.get("labelId") or ann.get("id") or f"label-{ann_idx}")
+        class_id = int(ann.get("classId", ann.get("category_id", 0)))
+        for seg in ann.get("segmentation", []):
+            if len(seg) < 6 or len(seg) % 2 != 0:
+                continue
+            points = [{"x": float(seg[i]), "y": float(seg[i + 1])} for i in range(0, len(seg), 2)]
+            polygons.append({"labelId": label_id, "classId": class_id, "points": points})
+    return polygons
+
+
+def _write_multipolygon_label(coco_path: Path, polygons) -> None:
+    grouped = {}
+    for poly in _normalize_polygon_dicts(polygons):
+        label = grouped.setdefault(poly["labelId"], {"labelId": poly["labelId"], "classId": poly["classId"], "segmentation": []})
+        label["classId"] = poly["classId"]
+        label["segmentation"].append([
+            coord
+            for pt in poly["points"]
+            for coord in (round(float(pt["x"]), 6), round(float(pt["y"]), 6))
+        ])
+
+    payload = {
+        "version": 1,
+        "type": "image_segmentation_multipolygon",
+        "annotations": [
+            {"id": label_id, "labelId": label_id, "classId": item["classId"], "segmentation": item["segmentation"]}
+            for label_id, item in sorted(grouped.items())
+        ],
+    }
+    coco_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(coco_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+
+
+def _rotate_points(points: list, index: int) -> list:
+    return points[index:] + points[:index]
+
+
+def _connect_polygons_with_zero_width_bridges(polygons: list) -> list:
+    """Flatten one label's polygons into one YOLO-compatible ring.
+
+    YOLO segmentation has one contour per label line. For multiple islands of
+    the same label, this creates self-touching zero-width bridges so the mask
+    rasterizes like separate polygons in most YOLO tooling.
+    """
+    rings = [[{"x": float(pt["x"]), "y": float(pt["y"])} for pt in poly["points"]] for poly in polygons]
+    rings = [ring for ring in rings if len(ring) >= 3]
+    if not rings:
+        return []
+
+    connected = list(rings[0])
+    anchor = connected[0]
+    remaining = rings[1:]
+    while remaining:
+        best = None
+        for ring_idx, ring in enumerate(remaining):
+            for pt_idx, pt in enumerate(ring):
+                dist = (pt["x"] - anchor["x"]) ** 2 + (pt["y"] - anchor["y"]) ** 2
+                if best is None or dist < best[0]:
+                    best = (dist, ring_idx, pt_idx)
+        _, ring_idx, pt_idx = best
+        ring = remaining.pop(ring_idx)
+        bridge = ring[pt_idx]
+        connected.extend([anchor, bridge])
+        connected.extend(_rotate_points(ring, pt_idx))
+        connected.extend([bridge, anchor])
+        anchor = bridge
+    return connected
+
+
+def _write_yolo_label_from_polygons(label_path: Path, polygons) -> None:
+    grouped = {}
+    for poly in _normalize_polygon_dicts(polygons):
+        label = grouped.setdefault(poly["labelId"], {"classId": poly["classId"], "polygons": []})
+        label["classId"] = poly["classId"]
+        label["polygons"].append(poly)
+
+    label_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(label_path, "w", encoding="utf-8") as f:
+        for label_id, label in sorted(grouped.items()):
+            label_polygons = label["polygons"]
+            points = (
+                label_polygons[0]["points"]
+                if len(label_polygons) == 1
+                else _connect_polygons_with_zero_width_bridges(label_polygons)
+            )
+            if len(points) < 3:
+                continue
+            coords_str = " ".join(f"{pt['x']:.6f} {pt['y']:.6f}" for pt in points)
+            f.write(f"{label['classId']} {coords_str}\n")
+
+
+def _compute_same_class_mask_overlap_score(polygons, mask_size: int = 256) -> float:
+    """Return max same-class overlap between different labels in one image.
+
+    The score is intersection / smaller-mask-area, so a near-duplicate label
+    contained in another label scores close to 1.0 even when IoU is lower.
+    """
+    labels = {}
+    for poly in _normalize_polygon_dicts(polygons):
+        item = labels.setdefault(poly["labelId"], {"classId": poly["classId"], "polygons": []})
+        item["classId"] = poly["classId"]
+        item["polygons"].append(poly)
+
+    by_class = {}
+    for label_id, item in labels.items():
+        by_class.setdefault(item["classId"], []).append((label_id, item["polygons"]))
+
+    if not any(len(items) >= 2 for items in by_class.values()):
+        return 0.0
+
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return 0.0
+
+    def rasterize(label_polygons):
+        mask = np.zeros((mask_size, mask_size), dtype=np.uint8)
+        for poly in label_polygons:
+            pts = []
+            for pt in poly["points"]:
+                x = int(round(max(0.0, min(1.0, float(pt["x"]))) * (mask_size - 1)))
+                y = int(round(max(0.0, min(1.0, float(pt["y"]))) * (mask_size - 1)))
+                pts.append([x, y])
+            if len(pts) >= 3:
+                cv2.fillPoly(mask, [np.array(pts, dtype=np.int32)], 1)
+        return mask
+
+    best = 0.0
+    for items in by_class.values():
+        if len(items) < 2:
+            continue
+        masks = []
+        for label_id, label_polygons in items:
+            mask = rasterize(label_polygons)
+            area = int(mask.sum())
+            if area > 0:
+                masks.append((label_id, mask, area))
+        for i in range(len(masks)):
+            for j in range(i + 1, len(masks)):
+                _, ma, area_a = masks[i]
+                _, mb, area_b = masks[j]
+                inter = int((ma & mb).sum())
+                if inter <= 0:
+                    continue
+                score = inter / max(1, min(area_a, area_b))
+                if score > best:
+                    best = score
+    return round(float(best), 4)
+
+
 def _compute_label_polygon_stats(label_path: Path):
     total = 0
     point_counts = []
     edge_scores = []
-    if label_path.exists():
-        with open(label_path, "r", encoding="utf-8") as lf:
-            for line in lf:
-                parts = line.strip().split()
-                if len(parts) >= 7 and len(parts) % 2 == 1:
-                    total += 1
-                    point_counts.append((len(parts) - 1) // 2)
-                    edge_scores.append(_polygon_edge_score(parts[1:]))
+    polygons_for_overlap = []
+    coco_path = _multipolygon_path_for_label(label_path)
+    if coco_path.exists():
+        try:
+            polygons_for_overlap = _read_multipolygon_label(coco_path)
+            for poly in polygons_for_overlap:
+                coords = [coord for pt in poly["points"] for coord in (pt["x"], pt["y"])]
+                total += 1
+                point_counts.append(len(poly["points"]))
+                edge_scores.append(_polygon_edge_score(coords))
+        except Exception:
+            pass
+    elif label_path.exists():
+        try:
+            polygons_for_overlap = _read_yolo_label(label_path)
+            for poly in polygons_for_overlap:
+                coords = [coord for pt in poly["points"] for coord in (pt["x"], pt["y"])]
+                total += 1
+                point_counts.append(len(poly["points"]))
+                edge_scores.append(_polygon_edge_score(coords))
+        except Exception:
+            with open(label_path, "r", encoding="utf-8") as lf:
+                for line in lf:
+                    parts = line.strip().split()
+                    if len(parts) >= 7 and len(parts) % 2 == 1:
+                        total += 1
+                        point_counts.append((len(parts) - 1) // 2)
+                        edge_scores.append(_polygon_edge_score(parts[1:]))
     return {
         "total_polygons": total,
         "max_polygon_points": max(point_counts) if point_counts else 0,
         "min_polygon_points": min(point_counts) if point_counts else 0,
         "edge_score": max(edge_scores) if edge_scores else 0.0,
+        "mask_overlap_score": _compute_same_class_mask_overlap_score(polygons_for_overlap),
     }
+
+def _label_has_segmentation_annotations(label_path: Path) -> bool:
+    coco_path = _multipolygon_path_for_label(label_path)
+    if coco_path.exists():
+        try:
+            return any(len(poly.get("points", [])) >= 3 for poly in _read_multipolygon_label(coco_path))
+        except Exception:
+            pass
+    if not label_path.exists():
+        return False
+    try:
+        with open(label_path, "r", encoding="utf-8") as lf:
+            for line in lf:
+                parts = line.strip().split()
+                if len(parts) >= 7 and len(parts) % 2 == 1:
+                    return True
+    except Exception:
+        return False
+    return False
 
 def _negative_samples_file(dataset_name: str) -> Path:
     """Per-dataset list of images intentionally left unlabeled (true negatives).
@@ -117,7 +673,49 @@ def save_negative_samples(dataset_name: str, names) -> None:
         json.dump(sorted(names), f)
 
 
-META_SCHEMA_VERSION = 2
+def _auto_unreviewed_file(dataset_name: str) -> Path:
+    return DATASETS_DIR / dataset_name / "auto_labeled_unreviewed.json"
+
+
+def load_auto_labeled_unreviewed(dataset_name: str) -> set:
+    p = _auto_unreviewed_file(dataset_name)
+    if not p.exists():
+        return set()
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data) if isinstance(data, list) else set()
+    except Exception:
+        return set()
+
+
+def save_auto_labeled_unreviewed(dataset_name: str, names) -> None:
+    p = _auto_unreviewed_file(dataset_name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(sorted(names), f)
+
+
+def clear_auto_labeled_unreviewed(dataset_name: str, image_filename: str) -> bool:
+    names = load_auto_labeled_unreviewed(dataset_name)
+    if image_filename not in names:
+        return False
+    names.discard(image_filename)
+    save_auto_labeled_unreviewed(dataset_name, names)
+    return True
+
+
+def _image_filename_for_label_path(label_path: Path) -> Optional[str]:
+    images_dir = label_path.parent.parent / "images"
+    if not images_dir.exists():
+        return None
+    for img_file in images_dir.glob(f"{label_path.stem}.*"):
+        if img_file.suffix.lower() in IMAGE_EXTS:
+            return img_file.name
+    return None
+
+
+META_SCHEMA_VERSION = 3
 
 def get_image_meta(dataset_name: str, force_rebuild: bool = False) -> dict:
     """Return per-image metadata (created/modified/polygon stats).
@@ -153,13 +751,16 @@ def get_image_meta(dataset_name: str, force_rebuild: bool = False) -> dict:
 
             lbl_file = labels_dir / (img_file.stem + ".txt")
             lbl_mtime = lbl_file.stat().st_mtime if lbl_file.exists() else 0.0
+            coco_file = _multipolygon_path_for_label(lbl_file)
+            coco_mtime = coco_file.stat().st_mtime if coco_file.exists() else 0.0
 
             existing = meta.get(img_file.name)
             if (not force_rebuild
                     and existing
                     and existing.get("v") == META_SCHEMA_VERSION
                     and existing.get("img_mtime") == img_mtime
-                    and existing.get("lbl_mtime") == lbl_mtime):
+                    and existing.get("lbl_mtime") == lbl_mtime
+                    and existing.get("coco_mtime") == coco_mtime):
                 continue
 
             created = getattr(img_stat, "st_birthtime", img_stat.st_ctime)
@@ -171,6 +772,7 @@ def get_image_meta(dataset_name: str, force_rebuild: bool = False) -> dict:
                 "modified": img_mtime,
                 "img_mtime": img_mtime,
                 "lbl_mtime": lbl_mtime,
+                "coco_mtime": coco_mtime,
                 **poly_stats,
             }
             updated = True
@@ -224,6 +826,13 @@ async def read_dataset(request: Request, dataset_name: str):
 
     image_meta = get_image_meta(dataset_name)
     negative_samples = load_negative_samples(dataset_name)
+    auto_unreviewed = load_auto_labeled_unreviewed(dataset_name)
+    image_tags_by_name = {}
+    try:
+        tag_db = TagSearchDatabase(DATASETS_DIR / dataset_name)
+        # Filled after image discovery below.
+    except Exception:
+        tag_db = None
 
     # Let's find images (looking into train/images for now, or val/images, test/images)
     images = []
@@ -237,12 +846,25 @@ async def read_dataset(request: Request, dataset_name: str):
                      stem_counts[img_file.stem] = stem_counts.get(img_file.stem, 0) + 1
                      all_img_files.append((split, img_file))
 
+    if tag_db is not None:
+        try:
+            image_tags_by_name = tag_db.tags_for_filenames([p.name for _, p in all_img_files], limit_per_image=24)
+        except Exception:
+            image_tags_by_name = {}
+
     for split, img_file in all_img_files:
         labels_dir = DATASETS_DIR / dataset_name / split / "labels"
         label_file = labels_dir / (img_file.stem + ".txt")
 
         classes_present = set()
-        if label_file.exists():
+        coco_file = _multipolygon_path_for_label(label_file)
+        if coco_file.exists():
+            try:
+                for poly in _read_multipolygon_label(coco_file):
+                    classes_present.add(int(poly["classId"]))
+            except Exception:
+                pass
+        elif label_file.exists():
             with open(label_file, "r", encoding="utf-8") as lf:
                 for line in lf:
                     parts = line.strip().split()
@@ -253,12 +875,14 @@ async def read_dataset(request: Request, dataset_name: str):
                             pass
 
         m = image_meta.get(img_file.name, {})
+        tag_items = image_tags_by_name.get(img_file.name, [])
         images.append({
             "name": img_file.name,
             "path": f"/datasets/{dataset_name}/{split}/images/{img_file.name}",
             "label_path": f"/datasets/{dataset_name}/{split}/labels/{label_file.name}",
-            "has_label": label_file.exists(),
+            "has_label": _label_has_segmentation_annotations(label_file),
             "is_negative": img_file.name in negative_samples,
+            "is_auto_unreviewed": img_file.name in auto_unreviewed,
             "split": split,
             "classes_present": list(classes_present),
             "is_duplicate": stem_counts[img_file.stem] > 1,
@@ -269,6 +893,9 @@ async def read_dataset(request: Request, dataset_name: str):
             "max_polygon_points": m.get("max_polygon_points", 0),
             "min_polygon_points": m.get("min_polygon_points", 0),
             "edge_score": m.get("edge_score", 0.0),
+            "mask_overlap_score": m.get("mask_overlap_score", 0.0),
+            "tags": tag_items,
+            "tag_names": [t.get("tag", "") for t in tag_items],
         })
     
     return templates.TemplateResponse(
@@ -290,13 +917,16 @@ async def read_editor(request: Request, dataset_name: str, img: str, lbl: str):
         data = yaml.safe_load(f)
     
     classes = data.get("names", [])
+    image_filename = Path(urllib.parse.unquote(img).split("?")[0]).name
+    is_auto_unreviewed = image_filename in load_auto_labeled_unreviewed(dataset_name)
     
     return templates.TemplateResponse(
         request=request, name="editor.html", context={
             "dataset_name": dataset_name,
             "image_url": img,
             "label_url": lbl,
-            "classes": classes
+            "classes": classes,
+            "is_auto_unreviewed": is_auto_unreviewed,
         }
     )
 
@@ -308,6 +938,7 @@ class Point(BaseModel):
     y: float
 
 class Polygon(BaseModel):
+    labelId: Optional[str] = None
     classId: int
     points: List[Point]
 
@@ -317,6 +948,14 @@ class SaveLabelsRequest(BaseModel):
     polygons: List[Polygon]
 
 import urllib.parse
+
+
+def _polygon_response(poly: Polygon, points=None) -> dict:
+    return {
+        "labelId": poly.labelId,
+        "classId": poly.classId,
+        "points": points if points is not None else [{"x": pt.x, "y": pt.y} for pt in poly.points],
+    }
 
 @app.get("/api/labels")
 async def api_get_labels(dataset: str, label_path: str):
@@ -328,31 +967,21 @@ async def api_get_labels(dataset: str, label_path: str):
     # stripping the absolute leading slash makes it a relative path to concatenate.
     physical_path = BASE_DIR / decoded_path.lstrip("/")
     
-    polygons = []
-    if physical_path.exists():
-        with open(physical_path, "r", encoding="utf-8") as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) >= 7 and len(parts) % 2 == 1: # class_id x1 y1 x2 y2 x3 y3 ...
-                    class_id = int(parts[0])
-                    coords = [float(x) for x in parts[1:]]
-                    points = [{"x": coords[i], "y": coords[i+1]} for i in range(0, len(coords), 2)]
-                    polygons.append({"classId": class_id, "points": points})
-                    
+    coco_path = _multipolygon_path_for_label(physical_path)
+    polygons = _read_multipolygon_label(coco_path) if coco_path.exists() else _read_yolo_label(physical_path)
     return {"polygons": polygons}
 
 @app.post("/api/save_labels")
 async def api_save_labels(req: SaveLabelsRequest):
     physical_path = BASE_DIR / req.label_path.lstrip("/")
-    
-    # Ensure parent dir exists
-    physical_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(physical_path, "w", encoding="utf-8") as f:
-        for poly in req.polygons:
-            coords_str = " ".join([f"{pt.x:.6f} {pt.y:.6f}" for pt in poly.points])
-            f.write(f"{poly.classId} {coords_str}\n")
-            
+    polygons = _normalize_polygon_dicts(req.polygons)
+
+    _write_multipolygon_label(_multipolygon_path_for_label(physical_path), polygons)
+    _write_yolo_label_from_polygons(physical_path, polygons)
+    image_filename = _image_filename_for_label_path(physical_path)
+    if image_filename:
+        clear_auto_labeled_unreviewed(req.dataset_name, image_filename)
+
     return {"status": "ok"}
 
 class ModifyClassRequest(BaseModel):
@@ -367,39 +996,77 @@ def update_label_files(dataset_name: str, deleted_id: int, merge_target_id: int 
     # Any ID > deleted_id decreases by 1.
     for split in ALL_SPLITS:
         labels_dir = DATASETS_DIR / dataset_name / split / "labels"
-        if not labels_dir.exists(): continue
-        for txt_file in labels_dir.glob("*.txt"):
-            lines = []
-            modified = False
-            with open(txt_file, "r") as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if not parts: continue
-                    c_id = int(parts[0])
-                    if c_id == deleted_id:
-                        if merge_target_id != -1:
-                            # It becomes the target
-                            new_id = merge_target_id
-                            # If target ID is originally > deleted_id, its new ID will be target_id - 1
-                            if merge_target_id > deleted_id:
-                                new_id -= 1
-                            lines.append(f"{new_id} {' '.join(parts[1:])}\n")
-                            modified = True
+        if labels_dir.exists():
+            for txt_file in labels_dir.glob("*.txt"):
+                lines = []
+                modified = False
+                with open(txt_file, "r") as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if not parts: continue
+                        c_id = int(parts[0])
+                        if c_id == deleted_id:
+                            if merge_target_id != -1:
+                                # It becomes the target
+                                new_id = merge_target_id
+                                # If target ID is originally > deleted_id, its new ID will be target_id - 1
+                                if merge_target_id > deleted_id:
+                                    new_id -= 1
+                                lines.append(f"{new_id} {' '.join(parts[1:])}\n")
+                                modified = True
+                            else:
+                                # Just deleted
+                                modified = True
+                                continue
                         else:
-                            # Just deleted
-                            modified = True
-                            continue
-                    else:
-                        new_id = c_id
-                        if c_id > deleted_id:
-                            new_id -= 1
-                        if new_id != c_id:
-                            modified = True
-                        lines.append(f"{new_id} {' '.join(parts[1:])}\n")
-            
+                            new_id = c_id
+                            if c_id > deleted_id:
+                                new_id -= 1
+                            if new_id != c_id:
+                                modified = True
+                            lines.append(f"{new_id} {' '.join(parts[1:])}\n")
+
+                if modified:
+                    with open(txt_file, "w") as f:
+                        f.writelines(lines)
+                    _write_yolo_label_from_polygons(txt_file, _read_yolo_label(txt_file))
+
+        coco_dir = DATASETS_DIR / dataset_name / split / MULTIPOLYGON_LABEL_DIR
+        if not coco_dir.exists():
+            continue
+        for json_file in coco_dir.glob("*.json"):
+            try:
+                with open(json_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+
+            annotations = []
+            modified = False
+            for ann in data.get("annotations", []):
+                try:
+                    c_id = int(ann.get("classId", ann.get("category_id", -1)))
+                except (TypeError, ValueError):
+                    annotations.append(ann)
+                    continue
+                if c_id == deleted_id:
+                    if merge_target_id == -1:
+                        modified = True
+                        continue
+                    new_id = merge_target_id - 1 if merge_target_id > deleted_id else merge_target_id
+                    modified = True
+                else:
+                    new_id = c_id - 1 if c_id > deleted_id else c_id
+                    modified = modified or (new_id != c_id)
+                ann["classId"] = new_id
+                ann.pop("category_id", None)
+                annotations.append(ann)
+
             if modified:
-                with open(txt_file, "w") as f:
-                    f.writelines(lines)
+                data["annotations"] = annotations
+                with open(json_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+                _write_yolo_label_from_polygons(labels_dir / f"{json_file.stem}.txt", _read_multipolygon_label(json_file))
 
 @app.post("/api/class_manage")
 async def api_class_manage(req: ModifyClassRequest):
@@ -452,9 +1119,124 @@ class AutoSegmentRequest(BaseModel):
     h_col: float = 10.0
     tw: int = 7
     sw: int = 21
+    use_padding_inference: bool = False
+    pad_y_percent: float = 30.0
+    pad_x_percent: float = 0.0
+    large_threshold: float = 60.0
+    padding_merge_mode: str = "large_only"
+    padding_match_iou: float = 0.2
+
+
+def _collect_yolo_result_polygons(result, dataset_classes: list) -> list:
+    predictions = []
+    if result is None or result.masks is None or result.boxes is None:
+        return predictions
+
+    name_to_id = {str(name).lower(): idx for idx, name in enumerate(dataset_classes)}
+    model_classes = result.names or {}
+    masks_xyn = result.masks.xyn
+    class_ids = result.boxes.cls.tolist()
+
+    for mask_xyn, cls_id_float in zip(masks_xyn, class_ids):
+        model_cls_id = int(cls_id_float)
+        model_cls_name = str(model_classes.get(model_cls_id, f"class_{model_cls_id}"))
+        dataset_cls_id = name_to_id.get(model_cls_name.lower())
+        if dataset_cls_id is None:
+            print(f"[auto_label] skipping unmapped model class: {model_cls_name}", flush=True)
+            continue
+
+        points = [{"x": _clamp01(float(x)), "y": _clamp01(float(y))} for x, y in mask_xyn]
+        if len({(round(pt["x"], 6), round(pt["y"], 6)) for pt in points}) >= 3:
+            predictions.append({
+                "classId": dataset_cls_id,
+                "points": points,
+            })
+    return predictions
+
+
+def _group_auto_label_predictions(predictions: list, merge_mask_size: int = 1024) -> list:
+    by_class = {}
+    for pred in predictions:
+        class_id = int(pred.get("classId", 0))
+        points = pred.get("points") or []
+        if len(points) < 3:
+            continue
+        by_class.setdefault(class_id, []).append(points)
+
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        grouped = []
+        for class_id, polygons in by_class.items():
+            for points in polygons:
+                grouped.append({
+                    "labelId": f"auto-class-{class_id}",
+                    "classId": class_id,
+                    "points": points,
+                })
+        return grouped
+
+    size = max(128, min(4096, int(merge_mask_size)))
+    merged = []
+    for class_id, polygons in sorted(by_class.items()):
+        mask = np.zeros((size, size), dtype=np.uint8)
+        for points in polygons:
+            pts = np.array(
+                [
+                    [
+                        int(round(_clamp01(pt["x"]) * (size - 1))),
+                        int(round(_clamp01(pt["y"]) * (size - 1))),
+                    ]
+                    for pt in points
+                ],
+                dtype=np.int32,
+            )
+            if len(pts) >= 3:
+                cv2.fillPoly(mask, [pts], 1)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)
+        for contour in contours:
+            if len(contour) < 3 or cv2.contourArea(contour) <= 1:
+                continue
+            epsilon = max(0.5, size * 0.0008)
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            if len(approx) < 3:
+                approx = contour
+            out_points = [
+                {
+                    "x": _clamp01(float(pt[0][0]) / (size - 1)),
+                    "y": _clamp01(float(pt[0][1]) / (size - 1)),
+                }
+                for pt in approx
+            ]
+            if len({(round(pt["x"], 6), round(pt["y"], 6)) for pt in out_points}) >= 3:
+                merged.append({
+                    "labelId": f"auto-class-{class_id}",
+                    "classId": class_id,
+                    "points": out_points,
+                })
+    return merged
+
+
+def _resolve_auto_label_devices(torch_module):
+    configured = (
+        os.environ.get("AUTO_SEGMENT_DEVICE", "").strip()
+        or os.environ.get("YOLO_DEVICE", "").strip()
+    )
+    if configured:
+        device = int(configured) if configured.isdigit() else configured
+        return [device, device]
+    if torch_module.cuda.is_available() and torch_module.cuda.device_count() >= 2:
+        return [0, 1]
+    device = resolve_yolo_device(torch_module)
+    return [device, device]
+
 
 @app.post("/api/auto_segment")
 def api_auto_segment(req: AutoSegmentRequest):
+    request_started = time.time()
     model_path = MODELS_DIR / req.model_name
     if not model_path.exists():
         raise HTTPException(status_code=404, detail="Model not found")
@@ -477,60 +1259,332 @@ def api_auto_segment(req: AutoSegmentRequest):
         import tempfile
         import cv2
         import numpy as np
-    except ImportError:
-        raise HTTPException(status_code=500, detail="ultralytics or cv2 library is not installed.")
+        import torch
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load inference libraries: {e}")
 
-    model = YOLO(str(model_path))
-    
-    # Run prediction
-    if getattr(req, 'use_denoise', False):
-        # Apply OpenCV Denoising
+    device = resolve_yolo_device(torch)
+    use_cuda = yolo_uses_cuda(torch, device)
+    log_yolo_device(torch, device, "auto_segment")
+    model, model_imgsz, model_predict_lock = _get_cached_yolo_model(
+        model_path, device, "auto_segment", YOLO
+    )
+
+    base_img_bgr = None
+    use_padding_inference = bool(getattr(req, "use_padding_inference", False))
+    if getattr(req, "use_denoise", False) or use_padding_inference:
         img_bgr = cv2.imread(str(physical_img_path))
         if img_bgr is None:
-            raise HTTPException(status_code=500, detail="Failed to read image for denoising.")
-        
-        # dst = fastNlMeansDenoisingColored(src, dst, h, hColor, templateWindowSize, searchWindowSize)
-        denoised_img = cv2.fastNlMeansDenoisingColored(
-            img_bgr, None, float(req.h_lum), float(req.h_col), int(req.tw), int(req.sw)
-        )
-        results = model.predict(source=denoised_img, save=False, conf=0.25, retina_masks=True)
-    else:
-        results = model.predict(source=str(physical_img_path), save=False, conf=0.25, retina_masks=True)
-    
-    result = results[0]
-    
-    # Get model class names
-    model_classes = result.names
-    
-    predicted_polygons = []
-    
-    if result.masks is not None:
-        # masks.xyn provides normalized relative coordinates [0-1] which fits perfectly with our schema
-        masks_xyn = result.masks.xyn 
+            raise HTTPException(status_code=500, detail="Failed to read image for inference.")
+        if getattr(req, "use_denoise", False):
+            base_img_bgr = cv2.fastNlMeansDenoisingColored(
+                img_bgr, None, float(req.h_lum), float(req.h_col), int(req.tw), int(req.sw)
+            )
+        else:
+            base_img_bgr = img_bgr
+
+    def dataset_class_id(original_cls_id: int, model_classes: dict) -> int:
+        original_cls_name = model_classes.get(original_cls_id, f"class_{original_cls_id}")
+        if original_cls_name in dataset_classes:
+            return dataset_classes.index(original_cls_name)
+        print(f"Dataset '{req.dataset_name}' missing model class '{original_cls_name}'. Assuming 0.")
+        return 0
+
+    def collect_predictions(result, padded_shape=None, original_shape=None, pad_x_px=0, pad_y_px=0):
+        predictions = []
+        if result.masks is None:
+            return predictions
+
+        model_classes = result.names
+        masks_xyn = result.masks.xyn
         class_ids = result.boxes.cls.tolist()
-        
+
+        padded_w = padded_h = orig_w = orig_h = None
+        if padded_shape and original_shape:
+            padded_h, padded_w = padded_shape[:2]
+            orig_h, orig_w = original_shape[:2]
+
         for mask_xyn, cls_id_float in zip(masks_xyn, class_ids):
-            original_cls_id = int(cls_id_float)
-            original_cls_name = model_classes.get(original_cls_id, f"class_{original_cls_id}")
-            
-            # Try to map to dataset class
-            mapped_dataset_id = -1
-            if original_cls_name in dataset_classes:
-                mapped_dataset_id = dataset_classes.index(original_cls_name)
-            else:
-                # Class from model is unknown to this dataset. Fallback to 0 if possible, or append it.
-                # For safety against accidental schema breaking, we will default mapping to 0 for unknown classes
-                # and emit a warning.
-                mapped_dataset_id = 0
-                print(f"Dataset '{req.dataset_name}' missing model class '{original_cls_name}'. Assuming 0.")
-                
-            points = [{"x": float(x), "y": float(y)} for (x, y) in mask_xyn]
-            predicted_polygons.append({
-                "classId": mapped_dataset_id,
-                "points": points
-            })
-            
-    return {"polygons": predicted_polygons}
+            mapped_dataset_id = dataset_class_id(int(cls_id_float), model_classes)
+            points = []
+            for x, y in mask_xyn:
+                if padded_w and padded_h and orig_w and orig_h:
+                    px = (float(x) * padded_w - pad_x_px) / orig_w
+                    py = (float(y) * padded_h - pad_y_px) / orig_h
+                    points.append({"x": _clamp01(px), "y": _clamp01(py)})
+                else:
+                    points.append({"x": _clamp01(x), "y": _clamp01(y)})
+            if len({(round(pt["x"], 6), round(pt["y"], 6)) for pt in points}) >= 3:
+                predictions.append({
+                    "classId": mapped_dataset_id,
+                    "points": points,
+                })
+        return predictions
+
+    predict_kwargs = {
+        "save": False,
+        "conf": 0.25,
+        "retina_masks": True,
+        "device": device,
+        "half": use_cuda,
+        "imgsz": model_imgsz,
+    }
+
+    normal_source = base_img_bgr if base_img_bgr is not None else str(physical_img_path)
+    with model_predict_lock:
+        results = model.predict(source=normal_source, **predict_kwargs)
+    predicted_polygons = collect_predictions(results[0])
+
+    padding_info = {
+        "enabled": False,
+        "normal_count": len(predicted_polygons),
+        "padded_count": 0,
+        "merged_count": len(predicted_polygons),
+    }
+
+    if use_padding_inference:
+        if base_img_bgr is None:
+            base_img_bgr = cv2.imread(str(physical_img_path))
+        if base_img_bgr is None:
+            raise HTTPException(status_code=500, detail="Failed to read image for padding inference.")
+
+        orig_h, orig_w = base_img_bgr.shape[:2]
+        pad_y_ratio = max(0.0, float(getattr(req, "pad_y_percent", 30.0))) / 100.0
+        pad_x_ratio = max(0.0, float(getattr(req, "pad_x_percent", 0.0))) / 100.0
+        pad_y_px = int(round(orig_h * pad_y_ratio))
+        pad_x_px = int(round(orig_w * pad_x_ratio))
+
+        if pad_y_px > 0 or pad_x_px > 0:
+            padded_img = cv2.copyMakeBorder(
+                base_img_bgr,
+                pad_y_px,
+                pad_y_px,
+                pad_x_px,
+                pad_x_px,
+                cv2.BORDER_CONSTANT,
+                value=(114, 114, 114),
+            )
+        else:
+            padded_img = base_img_bgr
+
+        with model_predict_lock:
+            padded_results = model.predict(source=padded_img, **predict_kwargs)
+        padded_polygons = collect_predictions(
+            padded_results[0],
+            padded_shape=padded_img.shape,
+            original_shape=base_img_bgr.shape,
+            pad_x_px=pad_x_px,
+            pad_y_px=pad_y_px,
+        )
+        large_threshold_ratio = max(0.0, min(1.0, float(getattr(req, "large_threshold", 60.0)) / 100.0))
+        match_iou = max(0.0, min(1.0, float(getattr(req, "padding_match_iou", 0.2))))
+        predicted_polygons = _merge_padding_predictions(
+            predicted_polygons,
+            padded_polygons,
+            getattr(req, "padding_merge_mode", "large_only"),
+            large_threshold_ratio,
+            match_iou,
+            cv2,
+            np,
+        )
+        padding_info = {
+            "enabled": True,
+            "pad_y_percent": pad_y_ratio * 100.0,
+            "pad_x_percent": pad_x_ratio * 100.0,
+            "pad_y_px": pad_y_px,
+            "pad_x_px": pad_x_px,
+            "large_threshold": large_threshold_ratio * 100.0,
+            "merge_mode": getattr(req, "padding_merge_mode", "large_only"),
+            "match_iou": match_iou,
+            "normal_count": padding_info["normal_count"],
+            "padded_count": len(padded_polygons),
+            "merged_count": len(predicted_polygons),
+        }
+
+    print(
+        f"[inference] auto_segment completed model={req.model_name} "
+        f"polygons={len(predicted_polygons)} padding={padding_info['enabled']} "
+        f"elapsed_sec={time.time() - request_started:.2f}",
+        flush=True,
+    )
+    return {"polygons": predicted_polygons, "imgsz": model_imgsz, "padding_inference": padding_info}
+
+
+class AutoLabelPendingRequest(BaseModel):
+    model_a: str
+    model_b: str
+    conf: float = 0.25
+
+
+@app.post("/api/dataset/{dataset_name}/auto_label_pending")
+def api_auto_label_pending(dataset_name: str, req: AutoLabelPendingRequest):
+    if not (DATASETS_DIR / dataset_name).exists():
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    if not req.model_a or not req.model_b:
+        raise HTTPException(status_code=400, detail="Select two models")
+    if req.model_a == req.model_b:
+        raise HTTPException(status_code=400, detail="Select two different models")
+
+    progress_key = f"auto_label_{dataset_name}"
+    current_progress = PROGRESS_CACHE.get(progress_key) or {}
+    if current_progress.get("status") == "running":
+        raise HTTPException(status_code=409, detail="Auto labeling is already running")
+
+    model_path_a = MODELS_DIR / req.model_a
+    model_path_b = MODELS_DIR / req.model_b
+    if not model_path_a.exists() or not model_path_b.exists():
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    yaml_path = get_yaml_path(dataset_name)
+    if not yaml_path.exists():
+        raise HTTPException(status_code=404, detail="data.yaml not found")
+    with open(yaml_path, "r", encoding="utf-8") as f:
+        data_yaml = yaml.safe_load(f)
+    dataset_classes = data_yaml.get("names", []) or []
+
+    try:
+        from ultralytics import YOLO
+        import torch
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load inference libraries: {e}")
+
+    pending_img_dir = DATASETS_DIR / dataset_name / PENDING_SPLIT / "images"
+    pending_lbl_dir = DATASETS_DIR / dataset_name / PENDING_SPLIT / "labels"
+    pending_coco_dir = DATASETS_DIR / dataset_name / PENDING_SPLIT / MULTIPOLYGON_LABEL_DIR
+    pending_lbl_dir.mkdir(parents=True, exist_ok=True)
+    pending_coco_dir.mkdir(parents=True, exist_ok=True)
+
+    negatives = load_negative_samples(dataset_name)
+    auto_unreviewed = load_auto_labeled_unreviewed(dataset_name)
+
+    target_images = []
+    skipped_negative = 0
+    skipped_reviewed = 0
+    if pending_img_dir.exists():
+        for img_file in sorted(pending_img_dir.glob("*.*")):
+            if img_file.suffix.lower() not in IMAGE_EXTS:
+                continue
+            if img_file.name in negatives:
+                skipped_negative += 1
+                continue
+            lbl_file = pending_lbl_dir / f"{img_file.stem}.txt"
+            if img_file.name not in auto_unreviewed and _label_has_segmentation_annotations(lbl_file):
+                skipped_reviewed += 1
+                continue
+            target_images.append(img_file)
+
+    started_at = time.time()
+
+    def set_auto_label_progress(current, total, last_duration=0.0, message="", status="running"):
+        PROGRESS_CACHE[progress_key] = {
+            "status": status,
+            "current": current,
+            "total": total,
+            "last_duration": last_duration,
+            "phase": "auto_label" if status == "running" else status,
+            "message": message,
+            "phase_started_at": started_at,
+            "started_at": started_at,
+            "updated_at": time.time(),
+        }
+
+    total = len(target_images)
+    set_auto_label_progress(0, total, message=f"Auto Label 0/{total}")
+    if total == 0:
+        set_auto_label_progress(
+            0,
+            0,
+            message=f"No pending images to auto label. Skipped reviewed {skipped_reviewed}, negative {skipped_negative}.",
+            status="done",
+        )
+        return {
+            "status": "ok",
+            "processed": 0,
+            "skipped_reviewed": skipped_reviewed,
+            "skipped_negative": skipped_negative,
+        }
+
+    devices = _resolve_auto_label_devices(torch)
+    use_cuda_a = yolo_uses_cuda(torch, devices[0])
+    use_cuda_b = yolo_uses_cuda(torch, devices[1])
+    log_yolo_device(torch, devices[0], f"auto_label:{req.model_a}")
+    log_yolo_device(torch, devices[1], f"auto_label:{req.model_b}")
+
+    model_a, imgsz_a, lock_a = _get_cached_yolo_model(model_path_a, devices[0], f"auto_label:{req.model_a}", YOLO)
+    model_b, imgsz_b, lock_b = _get_cached_yolo_model(model_path_b, devices[1], f"auto_label:{req.model_b}", YOLO)
+
+    conf = max(0.0, min(1.0, float(req.conf)))
+
+    def run_model(model, lock, img_path, device, use_cuda, imgsz):
+        with lock:
+            results = model.predict(
+                source=str(img_path),
+                save=False,
+                conf=conf,
+                verbose=False,
+                retina_masks=True,
+                device=device,
+                half=use_cuda,
+                imgsz=imgsz,
+            )
+        return _collect_yolo_result_polygons(results[0] if results else None, dataset_classes)
+
+    processed = 0
+    total_polygons = 0
+    errors = []
+    for idx, img_file in enumerate(target_images, start=1):
+        t0 = time.time()
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_a = executor.submit(run_model, model_a, lock_a, img_file, devices[0], use_cuda_a, imgsz_a)
+                future_b = executor.submit(run_model, model_b, lock_b, img_file, devices[1], use_cuda_b, imgsz_b)
+                predictions = future_a.result() + future_b.result()
+
+            polygons = _group_auto_label_predictions(predictions)
+            lbl_file = pending_lbl_dir / f"{img_file.stem}.txt"
+            coco_file = pending_coco_dir / f"{img_file.stem}.json"
+            _write_multipolygon_label(coco_file, polygons)
+            _write_yolo_label_from_polygons(lbl_file, polygons)
+
+            auto_unreviewed.add(img_file.name)
+            save_auto_labeled_unreviewed(dataset_name, auto_unreviewed)
+            processed += 1
+            total_polygons += len(polygons)
+            set_auto_label_progress(
+                idx,
+                total,
+                last_duration=time.time() - t0,
+                message=f"Auto Label {idx}/{total} · {img_file.name} · polygons {len(polygons)}",
+            )
+        except Exception as e:
+            errors.append({"image": img_file.name, "error": str(e)})
+            set_auto_label_progress(
+                idx,
+                total,
+                last_duration=time.time() - t0,
+                message=f"Auto Label {idx}/{total} · error: {img_file.name}",
+            )
+
+    status = "error" if errors else "done"
+    set_auto_label_progress(
+        total,
+        total,
+        message=f"Auto labeling complete: {processed}/{total}, polygons {total_polygons}, errors {len(errors)}",
+        status=status,
+    )
+    return {
+        "status": "ok" if not errors else "partial_error",
+        "processed": processed,
+        "target_count": total,
+        "total_polygons": total_polygons,
+        "skipped_reviewed": skipped_reviewed,
+        "skipped_negative": skipped_negative,
+        "errors": errors[:20],
+        "error_count": len(errors),
+        "devices": [str(devices[0]), str(devices[1])],
+        "imgsz": [imgsz_a, imgsz_b],
+    }
+
 
 class ShrinkPolygonsRequest(BaseModel):
     polygons: List[Polygon]
@@ -545,15 +1599,15 @@ async def api_shrink_polygons(req: ShrinkPolygonsRequest):
     except ImportError:
         raise HTTPException(status_code=500, detail="cv2/numpy not installed")
 
-    if req.shrink_percent <= 0:
-        return {"polygons": [{"classId": p.classId, "points": [{"x": pt.x, "y": pt.y} for pt in p.points]} for p in req.polygons]}
+    if req.shrink_percent == 0:
+        return {"polygons": [_polygon_response(p) for p in req.polygons]}
 
     target_set = set(req.indices) if req.indices is not None else None
     out = []
     for i, poly in enumerate(req.polygons):
         passthrough = (target_set is not None and i not in target_set) or len(poly.points) < 3
         if passthrough:
-            out.append({"classId": poly.classId, "points": [{"x": pt.x, "y": pt.y} for pt in poly.points]})
+            out.append(_polygon_response(poly))
             continue
 
         pts_arr = np.array([(pt.x, pt.y) for pt in poly.points], dtype=np.float64)
@@ -563,10 +1617,13 @@ async def api_shrink_polygons(req: ShrinkPolygonsRequest):
         bbox_h = float(max_xy[1] - min_xy[1])
         min_side = min(bbox_w, bbox_h)
         if min_side <= 0:
-            out.append({"classId": poly.classId, "points": []})
+            out.append(_polygon_response(poly, []))
             continue
 
-        shrink_px = max(1, int(round(min_side * req.shrink_percent / 100.0)))
+        is_expand = req.shrink_percent < 0
+        abs_percent = abs(req.shrink_percent)
+
+        shrink_px = max(1, int(round(min_side * abs_percent / 100.0)))
         pad = shrink_px + 2
         mask_w = int(np.ceil(bbox_w)) + 2 * pad
         mask_h = int(np.ceil(bbox_h)) + 2 * pad
@@ -577,26 +1634,45 @@ async def api_shrink_polygons(req: ShrinkPolygonsRequest):
 
         k = 2 * shrink_px + 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-        eroded = cv2.erode(mask, kernel)
+        if is_expand:
+            eroded = cv2.dilate(mask, kernel)
+        else:
+            eroded = cv2.erode(mask, kernel)
 
         contours, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
-            out.append({"classId": poly.classId, "points": []})
+            out.append(_polygon_response(poly, []))
             continue
 
         contour = max(contours, key=cv2.contourArea)
         contour = cv2.approxPolyDP(contour, 1.0, True)
         if len(contour) < 3:
-            out.append({"classId": poly.classId, "points": []})
+            out.append(_polygon_response(poly, []))
             continue
 
         new_pts = [
             {"x": float(c[0][0] - pad + min_xy[0]), "y": float(c[0][1] - pad + min_xy[1])}
             for c in contour
         ]
-        out.append({"classId": poly.classId, "points": new_pts})
+        out.append(_polygon_response(poly, new_pts))
 
     return {"polygons": out}
+
+PROGRESS_CACHE = {}
+
+@app.get("/api/dataset/{dataset_name}/progress/{task_type}")
+def api_get_progress(dataset_name: str, task_type: str):
+    key = f"{task_type}_{dataset_name}"
+    return PROGRESS_CACHE.get(key, {
+        "status": "idle",
+        "current": 0,
+        "total": 0,
+        "last_duration": 0.0,
+        "phase": "",
+        "message": "",
+        "started_at": None,
+        "updated_at": None,
+    })
 
 class SnapPolygonsRequest(BaseModel):
     image_path: str
@@ -633,7 +1709,7 @@ async def api_snap_polygons(req: SnapPolygonsRequest):
     for i, poly in enumerate(req.polygons):
         passthrough = (target_set is not None and i not in target_set) or len(poly.points) < 3
         if passthrough:
-            out.append({"classId": poly.classId, "points": [{"x": pt.x, "y": pt.y} for pt in poly.points]})
+            out.append(_polygon_response(poly))
             continue
 
         pts = np.array([(pt.x, pt.y) for pt in poly.points], dtype=np.float64)
@@ -646,7 +1722,7 @@ async def api_snap_polygons(req: SnapPolygonsRequest):
         y1 = min(H_img, int(np.ceil(max_xy[1])) + margin)
 
         if x1 - x0 < 4 or y1 - y0 < 4:
-            out.append({"classId": poly.classId, "points": [{"x": pt.x, "y": pt.y} for pt in poly.points]})
+            out.append(_polygon_response(poly))
             continue
 
         crop = img_bgr[y0:y1, x0:x1].copy()
@@ -672,29 +1748,101 @@ async def api_snap_polygons(req: SnapPolygonsRequest):
         try:
             cv2.grabCut(crop, init_mask, None, bgd_model, fgd_model, iterations, cv2.GC_INIT_WITH_MASK)
         except Exception:
-            out.append({"classId": poly.classId, "points": [{"x": pt.x, "y": pt.y} for pt in poly.points]})
+            out.append(_polygon_response(poly))
             continue
 
         fg_mask = np.where((init_mask == cv2.GC_FGD) | (init_mask == cv2.GC_PR_FGD), 1, 0).astype(np.uint8)
         contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
-            out.append({"classId": poly.classId, "points": [{"x": pt.x, "y": pt.y} for pt in poly.points]})
+            out.append(_polygon_response(poly))
             continue
 
         contour = max(contours, key=cv2.contourArea)
         if smooth_eps > 0.0:
             contour = cv2.approxPolyDP(contour, smooth_eps, True)
         if len(contour) < 3:
-            out.append({"classId": poly.classId, "points": [{"x": pt.x, "y": pt.y} for pt in poly.points]})
+            out.append(_polygon_response(poly))
             continue
 
         new_pts = [
             {"x": float(c[0][0] + x0), "y": float(c[0][1] + y0)}
             for c in contour
         ]
-        out.append({"classId": poly.classId, "points": new_pts})
+        out.append(_polygon_response(poly, new_pts))
 
     return {"polygons": out}
+
+
+class SplitPolygonRequest(BaseModel):
+    polygon: Polygon
+    stroke: List[Point]
+    brush_radius: float = 8.0
+    image_width: int
+    image_height: int
+
+
+@app.post("/api/split_polygon_by_stroke")
+async def api_split_polygon_by_stroke(req: SplitPolygonRequest):
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        raise HTTPException(status_code=500, detail="cv2/numpy not installed")
+
+    width = max(1, min(int(req.image_width), 10000))
+    height = max(1, min(int(req.image_height), 10000))
+    if len(req.polygon.points) < 3:
+        return {"polygons": []}
+
+    mask = np.zeros((height, width), dtype=np.uint8)
+    pts = np.array(
+        [
+            [
+                int(round(max(0, min(width - 1, pt.x)))),
+                int(round(max(0, min(height - 1, pt.y)))),
+            ]
+            for pt in req.polygon.points
+        ],
+        dtype=np.int32,
+    )
+    cv2.fillPoly(mask, [pts], 255)
+
+    radius = max(1.0, min(float(req.brush_radius), 200.0))
+    thickness = max(1, int(round(radius * 2)))
+    stroke_pts = [
+        (
+            int(round(max(0, min(width - 1, pt.x)))),
+            int(round(max(0, min(height - 1, pt.y)))),
+        )
+        for pt in req.stroke
+    ]
+    if len(stroke_pts) == 1:
+        cv2.circle(mask, stroke_pts[0], int(round(radius)), 0, -1, lineType=cv2.LINE_AA)
+    else:
+        for p1, p2 in zip(stroke_pts, stroke_pts[1:]):
+            cv2.line(mask, p1, p2, 0, thickness=thickness, lineType=cv2.LINE_AA)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = []
+    min_area = max(4.0, radius * radius * 0.25)
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True):
+        if cv2.contourArea(contour) < min_area:
+            continue
+        epsilon = max(0.75, min(3.0, radius * 0.08))
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        if len(approx) < 3:
+            continue
+        points = [{"x": float(c[0][0]), "y": float(c[0][1])} for c in approx]
+        if not _valid_polygon_piece(points):
+            continue
+        out.append({
+            "labelId": req.polygon.labelId,
+            "classId": req.polygon.classId,
+            "points": points,
+        })
+
+    return {"polygons": out}
+
 
 class AutoCheckRequest(BaseModel):
     model_name: str
@@ -709,25 +1857,42 @@ def api_auto_check(dataset_name: str, req: AutoCheckRequest):
         from ultralytics import YOLO
         import numpy as np
         import cv2
-    except ImportError:
-        raise HTTPException(status_code=500, detail="Missing required libraries for Auto Check")
+        import time
+        import torch
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load Auto Check libraries: {e}")
 
+    device = resolve_yolo_device(torch)
+    use_cuda = yolo_uses_cuda(torch, device)
+    log_yolo_device(torch, device, "auto_check")
     model = YOLO(str(model_path))
+    model_imgsz = log_yolo_imgsz(model, "auto_check")
     scores = {}
 
-    # Check all images in dataset (pending images have no labels, so skip them)
+    # List up target images first to get the total count for ETA estimation
+    target_images = []
     for split in TRAINING_SPLITS:
         images_dir = DATASETS_DIR / dataset_name / split / "images"
         labels_dir = DATASETS_DIR / dataset_name / split / "labels"
         if not images_dir.exists(): continue
-        
         for img_file in images_dir.glob("*.*"):
             if img_file.suffix.lower() not in [".jpg", ".jpeg", ".png", ".webp"]: continue
-            
-            lbl_file = labels_dir / (img_file.stem + ".txt")
+            target_images.append((img_file, labels_dir / (img_file.stem + ".txt")))
+
+    total_images = len(target_images)
+    PROGRESS_CACHE[f"auto_check_{dataset_name}"] = {
+        "status": "running",
+        "current": 0,
+        "total": total_images,
+        "last_duration": 0.0
+    }
+
+    try:
+        for idx, (img_file, lbl_file) in enumerate(target_images):
+            t0 = time.time()
             
             # Predict
-            results = model.predict(source=str(img_file), save=False, conf=0.25, verbose=False, retina_masks=True)
+            results = model.predict(source=str(img_file), save=False, conf=0.25, verbose=False, retina_masks=True, device=device, half=use_cuda, imgsz=model_imgsz)
             res = results[0]
             
             # Create a 640x640 mask for rendering (to calculate IoU fast via rasterization)
@@ -761,7 +1926,36 @@ def api_auto_check(dataset_name: str, req: AutoCheckRequest):
                 
             diff = 1.0 - iou
             scores[img_file.name] = round(diff, 4)
-            
+
+            # Clean up VRAM immediately to avoid memory accumulation
+            del res
+            if idx % 20 == 0:
+                if use_cuda:
+                    torch.cuda.empty_cache()
+
+            elapsed = time.time() - t0
+            PROGRESS_CACHE[f"auto_check_{dataset_name}"] = {
+                "status": "running",
+                "current": idx + 1,
+                "total": total_images,
+                "last_duration": elapsed
+            }
+        
+        PROGRESS_CACHE[f"auto_check_{dataset_name}"] = {
+            "status": "done",
+            "current": total_images,
+            "total": total_images,
+            "last_duration": 0.0
+        }
+    except Exception as e:
+        PROGRESS_CACHE[f"auto_check_{dataset_name}"] = {
+            "status": "error",
+            "current": len(scores),
+            "total": total_images,
+            "last_duration": 0.0
+        }
+        raise e
+
     scores_file = DATASETS_DIR / dataset_name / "auto_check.json"
     with open(scores_file, "w") as f:
         json.dump(scores, f)
@@ -787,8 +1981,9 @@ def api_auto_check_single(dataset_name: str, req: AutoCheckSingleRequest):
         from ultralytics import YOLO
         import numpy as np
         import cv2
-    except ImportError:
-        raise HTTPException(status_code=500, detail="Missing required libraries for Auto Check")
+        import torch
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load Auto Check libraries: {e}")
         
     decoded_img_path = urllib.parse.unquote(req.image_path)
     physical_img_path = BASE_DIR / decoded_img_path.lstrip("/")
@@ -796,7 +1991,12 @@ def api_auto_check_single(dataset_name: str, req: AutoCheckSingleRequest):
     if not physical_img_path.exists():
         raise HTTPException(status_code=404, detail="Image not found")
         
-    model = YOLO(str(model_path))
+    device = resolve_yolo_device(torch)
+    use_cuda = yolo_uses_cuda(torch, device)
+    log_yolo_device(torch, device, "auto_check_single")
+    model, model_imgsz, model_predict_lock = _get_cached_yolo_model(
+        model_path, device, "auto_check_single", YOLO
+    )
     
     lbl_file = physical_img_path.parent.parent / "labels" / (physical_img_path.stem + ".txt")
     
@@ -806,11 +2006,14 @@ def api_auto_check_single(dataset_name: str, req: AutoCheckSingleRequest):
             denoised_img = cv2.fastNlMeansDenoisingColored(
                 img_bgr, None, float(req.h_lum), float(req.h_col), int(req.tw), int(req.sw)
             )
-            results = model.predict(source=denoised_img, save=False, conf=0.25, verbose=False, retina_masks=True)
+            with model_predict_lock:
+                results = model.predict(source=denoised_img, save=False, conf=0.25, verbose=False, retina_masks=True, device=device, half=use_cuda, imgsz=model_imgsz)
         else:
-            results = model.predict(source=str(physical_img_path), save=False, conf=0.25, verbose=False, retina_masks=True)
+            with model_predict_lock:
+                results = model.predict(source=str(physical_img_path), save=False, conf=0.25, verbose=False, retina_masks=True, device=device, half=use_cuda, imgsz=model_imgsz)
     else:
-        results = model.predict(source=str(physical_img_path), save=False, conf=0.25, verbose=False, retina_masks=True)
+        with model_predict_lock:
+            results = model.predict(source=str(physical_img_path), save=False, conf=0.25, verbose=False, retina_masks=True, device=device, half=use_cuda, imgsz=model_imgsz)
         
     res = results[0]
     
@@ -856,14 +2059,19 @@ def api_auto_check_single(dataset_name: str, req: AutoCheckSingleRequest):
 class BenchmarkRequest(BaseModel):
     model_names: List[str]
     split: str = "test"  # "train" | "valid" | "test" | "val" | "all"
-    # Composite score weights. Default weighting reflects the censoring use case:
-    # missing a class is much worse than imperfect mask shape.
-    weight_mask: float = 0.30
-    weight_class: float = 0.40
-    weight_critical: float = 0.30
+    batch_size: Optional[int] = None
+    # Kept for request compatibility with older clients. Current scoring uses
+    # fixed point penalties instead of weighted IoU.
+    weight_mask: float = 0.65
+    weight_class: float = 0.15
+    weight_critical: float = 0.20
     # Class names that should be detected with high spatial accuracy (case-insensitive).
     # Names absent from the dataset's data.yaml are silently dropped.
-    critical_classes: List[str] = ["penis", "pussy"]
+    critical_classes: List[str] = ["penis", "pussy", "anus"]
+    # Classes to ignore completely during benchmark scoring. Ground-truth masks,
+    # predicted masks, class recall, false positives, and critical metrics for
+    # these classes are excluded.
+    ignored_classes: List[str] = ["nipple"]
 
 @app.post("/api/dataset/{dataset_name}/benchmark")
 def api_benchmark(dataset_name: str, req: BenchmarkRequest):
@@ -874,6 +2082,11 @@ def api_benchmark(dataset_name: str, req: BenchmarkRequest):
     if req.split not in valid_splits:
         raise HTTPException(status_code=400, detail=f"Invalid split: {req.split}")
 
+    benchmark_key = f"benchmark_{dataset_name}"
+    current_progress = PROGRESS_CACHE.get(benchmark_key) or {}
+    if current_progress.get("status") == "running":
+        raise HTTPException(status_code=409, detail="Benchmark is already running")
+
     splits = list(TRAINING_SPLITS) if req.split == "all" else [req.split]
 
     try:
@@ -882,8 +2095,8 @@ def api_benchmark(dataset_name: str, req: BenchmarkRequest):
         import cv2
         import torch
         import time
-    except ImportError as e:
-        raise HTTPException(status_code=500, detail=f"Missing required libraries: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load benchmark libraries: {e}")
 
     # Resolve dataset class list and intersect critical classes against it.
     yaml_path = get_yaml_path(dataset_name)
@@ -901,6 +2114,14 @@ def api_benchmark(dataset_name: str, req: BenchmarkRequest):
             critical_ids.append(name_to_id[key])
             critical_names_used.append(dataset_classes[name_to_id[key]])
     critical_id_set = set(critical_ids)
+    ignored_ids = []
+    ignored_names_used = []
+    for n in req.ignored_classes:
+        key = n.lower()
+        if key in name_to_id:
+            ignored_ids.append(name_to_id[key])
+            ignored_names_used.append(dataset_classes[name_to_id[key]])
+    ignored_id_set = set(ignored_ids)
 
     # Collect images and corresponding label paths from the requested split(s).
     image_paths = []
@@ -920,14 +2141,12 @@ def api_benchmark(dataset_name: str, req: BenchmarkRequest):
 
     H, W = 640, 640
 
-    # Pre-rasterize ground truth: overall (any-class union) + per-critical-class
-    # masks, plus the set of class IDs present per image.
-    gt_overall = []
-    gt_critical_masks = []  # list of dict {cls_id: mask}
+    # Pre-parse ground truth polygons instead of rasterizing all 640x640 masks into memory.
+    # This prevents massive RAM consumption (OOM) on large datasets.
+    gt_polygons = []  # list of list of dict: [{"cls_id": int, "pts": np.ndarray}]
     gt_class_sets = []
     for lbl_file in label_paths:
-        overall = np.zeros((H, W), dtype=np.uint8)
-        crit = {}
+        polys = []
         cls_set = set()
         if lbl_file.exists():
             with open(lbl_file, "r", encoding="utf-8") as f:
@@ -938,45 +2157,144 @@ def api_benchmark(dataset_name: str, req: BenchmarkRequest):
                             cls_id = int(float(parts[0]))
                         except ValueError:
                             continue
+                        if cls_id in ignored_id_set:
+                            continue
                         coords = [float(x) for x in parts[1:]]
                         pts = np.array(
                             [[int(coords[i] * W), int(coords[i + 1] * H)] for i in range(0, len(coords), 2)],
                             dtype=np.int32,
                         )
-                        cv2.fillPoly(overall, [pts], 1)
+                        polys.append({"cls_id": cls_id, "pts": pts})
                         cls_set.add(cls_id)
-                        if cls_id in critical_id_set:
-                            if cls_id not in crit:
-                                crit[cls_id] = np.zeros((H, W), dtype=np.uint8)
-                            cv2.fillPoly(crit[cls_id], [pts], 1)
-        gt_overall.append(overall)
-        gt_critical_masks.append(crit)
+        gt_polygons.append(polys)
         gt_class_sets.append(cls_set)
 
-    use_cuda = torch.cuda.is_available()
-    device = 0 if use_cuda else "cpu"
+    def rasterize_gt(polys, critical_ids_set):
+        overall = np.zeros((H, W), dtype=np.uint8)
+        crit = {}
+        for poly in polys:
+            cls_id = poly["cls_id"]
+            pts = poly["pts"]
+            cv2.fillPoly(overall, [pts], 1)
+            if cls_id in critical_ids_set:
+                if cls_id not in crit:
+                    crit[cls_id] = np.zeros((H, W), dtype=np.uint8)
+                cv2.fillPoly(crit[cls_id], [pts], 1)
+        return overall, crit
+
+    popcount_table = np.array([int(i).bit_count() for i in range(256)], dtype=np.uint8)
+
+    def packed_popcount(mask):
+        if mask is None:
+            return 0
+        return int(popcount_table[mask].sum())
+
+    def packed_coverage_score(gt_packed, gt_area, pred_packed):
+        """Coverage metrics using bit-packed masks without unpacking to 640x640."""
+        pred_area = packed_popcount(pred_packed)
+        inter = packed_popcount(np.bitwise_and(gt_packed, pred_packed))
+        union = gt_area + pred_area - inter
+        iou = 1.0 if union == 0 else inter / union
+        coverage = 1.0 if gt_area == 0 and pred_area == 0 else (inter / gt_area if gt_area > 0 else 0.0)
+        outside = max(pred_area - inter, 0)
+        false_positive_ratio = outside / pred_area if pred_area > 0 else 0.0
+        return {
+            "score": coverage,
+            "coverage": coverage,
+            "iou": iou,
+            "under_penalty": 1.0 - coverage if gt_area > 0 else 0.0,
+            "false_positive_ratio": false_positive_ratio,
+        }
+
+    def packed_critical_coverage(gt_info, pred_packed):
+        gt_area = gt_info["area"]
+        if gt_area == 0:
+            return None
+        if pred_packed is None:
+            return 0.0
+        inter = packed_popcount(np.bitwise_and(gt_info["packed"], pred_packed))
+        return inter / gt_area
+
+    gt_mask_cache = []
+    for polys in gt_polygons:
+        gt_o, gt_crit_masks = rasterize_gt(polys, critical_id_set)
+        gt_o_bool = gt_o > 0
+        crit_cache = {}
+        for cid, crit_mask in gt_crit_masks.items():
+            crit_bool = crit_mask > 0
+            crit_cache[cid] = {
+                "packed": np.packbits(crit_bool),
+                "area": int(crit_bool.sum()),
+            }
+        gt_mask_cache.append({
+            "overall": np.packbits(gt_o_bool),
+            "overall_area": int(gt_o_bool.sum()),
+            "critical": crit_cache,
+        })
+
+
+    device = resolve_yolo_device(torch)
+    use_cuda = yolo_uses_cuda(torch, device)
+    benchmark_batch_size = _resolve_benchmark_batch_size(req.batch_size)
+    log_yolo_device(torch, device, "benchmark")
+    print(f"[inference] benchmark using batch={benchmark_batch_size}", flush=True)
     paths_str = [str(p) for p in image_paths]
 
-    w_mask = float(req.weight_mask)
-    w_class = float(req.weight_class)
-    w_critical = float(req.weight_critical)
+    CRITICAL_MISS_MAX_POINTS = 50.0
+    FALSE_POSITIVE_MAX_POINTS = 20.0
 
-    def composite_from_means(mean_mask, mean_class, mean_critical):
-        total = 0.0
-        weight_used = 0.0
-        if mean_mask is not None:
-            total += w_mask * mean_mask
-            weight_used += w_mask
-        if mean_class is not None:
-            total += w_class * mean_class
-            weight_used += w_class
-        if mean_critical is not None:
-            total += w_critical * mean_critical
-            weight_used += w_critical
-        return (total / weight_used * 100.0) if weight_used > 0 else 0.0
+    def benchmark_penalty(mean_critical_coverage, mean_false_positive_ratio):
+        critical_penalty = 0.0
+        if mean_critical_coverage is not None:
+            critical_penalty = (1.0 - mean_critical_coverage) * CRITICAL_MISS_MAX_POINTS
+        false_positive_penalty = mean_false_positive_ratio * FALSE_POSITIVE_MAX_POINTS
+        penalty_points = min(100.0, critical_penalty + false_positive_penalty)
+        return {
+            "score": max(0.0, 100.0 - penalty_points),
+            "penalty": penalty_points / 100.0,
+            "penalty_points": penalty_points,
+            "critical_miss_penalty": critical_penalty,
+            "false_positive_penalty": false_positive_penalty,
+        }
 
+    benchmark_started_at = time.time()
+    model_phase_started_at = time.time()
+
+    def set_benchmark_progress(
+        current,
+        total,
+        last_duration=0.0,
+        phase="models",
+        message="",
+        phase_started_at=None,
+        status="running",
+    ):
+        now = time.time()
+        PROGRESS_CACHE[benchmark_key] = {
+            "status": status,
+            "current": current,
+            "total": total,
+            "last_duration": last_duration,
+            "phase": phase,
+            "message": message,
+            "phase_started_at": phase_started_at if phase_started_at is not None else time.time(),
+            "started_at": benchmark_started_at,
+            "updated_at": now,
+        }
+
+    total_models = len(req.model_names)
+    set_benchmark_progress(
+        0,
+        total_models,
+        phase="models",
+        message=f"Models 0/{total_models} · batch {benchmark_batch_size}",
+        phase_started_at=model_phase_started_at,
+    )
+
+    model_caches = {}
     results = []
-    for model_name in req.model_names:
+    adaptive_batch_size_by_imgsz = {}
+    for m_idx, model_name in enumerate(req.model_names):
         model_path = MODELS_DIR / model_name
         if not model_path.exists():
             results.append({
@@ -989,16 +2307,35 @@ def api_benchmark(dataset_name: str, req: BenchmarkRequest):
                 "critical_iou": None,
                 "image_count": 0,
                 "elapsed_sec": 0.0,
+                "batch_size": benchmark_batch_size,
             })
+            set_benchmark_progress(
+                m_idx + 1,
+                total_models,
+                0.0,
+                phase="models",
+                message=f"Models {m_idx + 1}/{total_models} · batch {benchmark_batch_size}",
+                phase_started_at=model_phase_started_at,
+            )
             continue
 
-        mask_ious = []
+        mask_scores = []
+        raw_ious = []
+        mask_coverages = []
+        undercoverage_penalties = []
+        false_positive_ratios = []
         class_recalls = []
-        critical_iou_values = []
+        critical_coverage_values = []
+        model_predictions = []
         t0 = time.time()
         model = None
+        current_batch_size = benchmark_batch_size
+        imgsz_key = "default"
         try:
             model = YOLO(str(model_path))
+            model_imgsz = log_yolo_imgsz(model, f"benchmark:{model_name}")
+            imgsz_key = json.dumps(model_imgsz, sort_keys=True)
+            current_batch_size = adaptive_batch_size_by_imgsz.get(imgsz_key, benchmark_batch_size)
             # Build a translation table from model class IDs to dataset class IDs
             # via name match (case-insensitive). Predictions whose model class has
             # no corresponding dataset class are ignored for class-aware metrics.
@@ -1008,79 +2345,174 @@ def api_benchmark(dataset_name: str, req: BenchmarkRequest):
                 if key in name_to_id:
                     model_to_dataset[int(mid)] = name_to_id[key]
 
-            stream = model.predict(
-                source=paths_str,
-                save=False,
-                conf=0.25,
-                verbose=False,
-                retina_masks=True,
-                device=device,
-                half=use_cuda,
-                stream=True,
-            )
-            for idx, res in enumerate(stream):
-                pred_overall = np.zeros((H, W), dtype=np.uint8)
-                pred_critical = {}
-                pred_class_set = set()
-                if res.masks is not None and res.boxes is not None:
-                    cls_ids = res.boxes.cls.tolist()
-                    for mask_xyn, mcls_f in zip(res.masks.xyn, cls_ids):
-                        mcls = int(mcls_f)
-                        pts = np.array(
-                            [[int(x * W), int(y * H)] for x, y in mask_xyn],
-                            dtype=np.int32,
+            while True:
+                mask_scores = []
+                raw_ious = []
+                mask_coverages = []
+                undercoverage_penalties = []
+                false_positive_ratios = []
+                class_recalls = []
+                critical_coverage_values = []
+                model_predictions = []
+                try:
+                    predict_kwargs = {
+                        "save": False,
+                        "conf": 0.25,
+                        "verbose": False,
+                        "retina_masks": True,
+                        "device": device,
+                        "half": use_cuda,
+                        "imgsz": model_imgsz,
+                    }
+
+                    def iter_prediction_results():
+                        if current_batch_size <= 1:
+                            for path_str in paths_str:
+                                single_results = model.predict(
+                                    source=path_str,
+                                    stream=False,
+                                    **predict_kwargs,
+                                )
+                                yield single_results[0] if single_results else None
+                        else:
+                            yield from model.predict(
+                                source=paths_str,
+                                stream=True,
+                                batch=current_batch_size,
+                                **predict_kwargs,
+                            )
+
+                    result_stream = iter_prediction_results()
+                    for idx, res in enumerate(result_stream):
+                        pred_overall = np.zeros((H, W), dtype=np.uint8)
+                        pred_critical = {}
+                        pred_class_set = set()
+                        if res is not None and res.masks is not None and res.boxes is not None:
+                            cls_ids = res.boxes.cls.tolist()
+                            for mask_xyn, mcls_f in zip(res.masks.xyn, cls_ids):
+                                mcls = int(mcls_f)
+                                pts = np.array(
+                                    [[int(x * W), int(y * H)] for x, y in mask_xyn],
+                                    dtype=np.int32,
+                                )
+                                dcls = model_to_dataset.get(mcls)
+                                if dcls in ignored_id_set:
+                                    continue
+                                cv2.fillPoly(pred_overall, [pts], 1)
+                                if dcls is not None:
+                                    pred_class_set.add(dcls)
+                                    if dcls in critical_id_set:
+                                        if dcls not in pred_critical:
+                                            pred_critical[dcls] = np.zeros((H, W), dtype=np.uint8)
+                                        cv2.fillPoly(pred_critical[dcls], [pts], 1)
+
+                        pred_overall_packed = np.packbits(pred_overall > 0)
+                        pred_critical_packed = {
+                            cid: np.packbits(mask > 0)
+                            for cid, mask in pred_critical.items()
+                        }
+
+                        # Only cache predictions if combination evaluation is possible (>= 2 models).
+                        # To save RAM, masks stay bit-packed and are scored with popcount.
+                        if len(req.model_names) >= 2:
+                            model_predictions.append({
+                                "overall": pred_overall_packed,
+                                "class_set": pred_class_set,
+                                "critical": pred_critical_packed,
+                            })
+
+                        gt_info = gt_mask_cache[idx]
+
+                        mask_metric = packed_coverage_score(
+                            gt_info["overall"],
+                            gt_info["overall_area"],
+                            pred_overall_packed,
                         )
-                        cv2.fillPoly(pred_overall, [pts], 1)
-                        if mcls in model_to_dataset:
-                            dcls = model_to_dataset[mcls]
-                            pred_class_set.add(dcls)
-                            if dcls in critical_id_set:
-                                if dcls not in pred_critical:
-                                    pred_critical[dcls] = np.zeros((H, W), dtype=np.uint8)
-                                cv2.fillPoly(pred_critical[dcls], [pts], 1)
+                        mask_scores.append(float(mask_metric["score"]))
+                        raw_ious.append(float(mask_metric["iou"]))
+                        mask_coverages.append(float(mask_metric["coverage"]))
+                        undercoverage_penalties.append(float(mask_metric["under_penalty"]))
+                        false_positive_ratios.append(float(mask_metric["false_positive_ratio"]))
 
-                gt_o = gt_overall[idx]
-                inter = int(np.logical_and(gt_o, pred_overall).sum())
-                union = int(np.logical_or(gt_o, pred_overall).sum())
-                mask_iou = 1.0 if union == 0 else inter / union
-                mask_ious.append(float(mask_iou))
+                        gt_cls = gt_class_sets[idx]
+                        if gt_cls:
+                            matched = gt_cls & pred_class_set
+                            class_recalls.append(len(matched) / len(gt_cls))
+                        # When GT has no classes, recall is undefined — skip rather than
+                        # rewarding empty predictions with a free 1.0.
 
-                gt_cls = gt_class_sets[idx]
-                if gt_cls:
-                    matched = gt_cls & pred_class_set
-                    class_recalls.append(len(matched) / len(gt_cls))
-                # When GT has no classes, recall is undefined — skip rather than
-                # rewarding empty predictions with a free 1.0.
+                        per_img_critical = []
+                        for cid in critical_ids:
+                            gt_crit_info = gt_info["critical"].get(cid)
+                            if gt_crit_info is None:
+                                continue
+                            crit_score = packed_critical_coverage(
+                                gt_crit_info,
+                                pred_critical_packed.get(cid),
+                            )
+                            if crit_score is not None:
+                                per_img_critical.append(float(crit_score))
+                        if per_img_critical:
+                            critical_coverage_values.append(float(np.mean(per_img_critical)))
 
-                per_img_critical = []
-                for cid in critical_ids:
-                    gt_m = gt_critical_masks[idx].get(cid)
-                    pr_m = pred_critical.get(cid)
-                    if gt_m is None and pr_m is None:
+                        # Explicitly delete the prediction results object to free VRAM immediately
+                        del res
+                    break
+                except RuntimeError as e:
+                    if use_cuda and current_batch_size > 1 and _is_cuda_oom_error(e):
+                        next_batch_size = max(1, current_batch_size // 2)
+                        print(
+                            f"[inference] benchmark:{model_name} CUDA OOM at batch={current_batch_size}; "
+                            f"retrying batch={next_batch_size}",
+                            flush=True,
+                        )
+                        current_batch_size = next_batch_size
+                        adaptive_batch_size_by_imgsz[imgsz_key] = current_batch_size
+                        torch.cuda.empty_cache()
                         continue
-                    if gt_m is None or pr_m is None:
-                        per_img_critical.append(0.0)
-                        continue
-                    ci = int(np.logical_and(gt_m, pr_m).sum())
-                    cu = int(np.logical_or(gt_m, pr_m).sum())
-                    per_img_critical.append(1.0 if cu == 0 else ci / cu)
-                if per_img_critical:
-                    critical_iou_values.append(float(np.mean(per_img_critical)))
+                    raise
         except Exception as e:
-            mean_mask = float(np.mean(mask_ious)) if mask_ious else None
+            mean_mask = float(np.mean(mask_scores)) if mask_scores else None
             mean_class = float(np.mean(class_recalls)) if class_recalls else None
-            mean_crit = float(np.mean(critical_iou_values)) if critical_iou_values else None
+            mean_crit = float(np.mean(critical_coverage_values)) if critical_coverage_values else None
+            mean_false_positive = float(np.mean(false_positive_ratios)) if false_positive_ratios else 0.0
+            penalty_info = benchmark_penalty(mean_crit, mean_false_positive)
+            if not mask_scores:
+                penalty_info = {
+                    "score": 0.0,
+                    "penalty": 1.0,
+                    "penalty_points": 100.0,
+                    "critical_miss_penalty": 0.0,
+                    "false_positive_penalty": 0.0,
+                }
             results.append({
                 "model": model_name,
                 "error": str(e),
-                "score": round(composite_from_means(mean_mask, mean_class, mean_crit), 2),
+                "score": round(penalty_info["score"], 2),
+                "penalty": round(penalty_info["penalty"], 4),
+                "penalty_points": round(penalty_info["penalty_points"], 2),
+                "critical_miss_penalty": round(penalty_info["critical_miss_penalty"], 2),
+                "false_positive_penalty": round(penalty_info["false_positive_penalty"], 2),
                 "mean_iou": round(mean_mask, 4) if mean_mask is not None else 0.0,
-                "median_iou": round(float(np.median(mask_ious)), 4) if mask_ious else 0.0,
+                "raw_iou": round(float(np.mean(raw_ious)), 4) if raw_ious else 0.0,
+                "mask_coverage": round(float(np.mean(mask_coverages)), 4) if mask_coverages else 0.0,
+                "overreach": round(mean_false_positive, 4),
+                "undercoverage": round(float(np.mean(undercoverage_penalties)), 4) if undercoverage_penalties else 0.0,
+                "median_iou": round(float(np.median(mask_scores)), 4) if mask_scores else 0.0,
                 "class_recall": round(mean_class, 4) if mean_class is not None else None,
                 "critical_iou": round(mean_crit, 4) if mean_crit is not None else None,
-                "image_count": len(mask_ious),
+                "image_count": len(mask_scores),
                 "elapsed_sec": round(time.time() - t0, 2),
+                "batch_size": current_batch_size,
             })
+            set_benchmark_progress(
+                m_idx + 1,
+                total_models,
+                time.time() - t0,
+                phase="models",
+                message=f"Models {m_idx + 1}/{total_models} · batch {current_batch_size}",
+                phase_started_at=model_phase_started_at,
+            )
             continue
         finally:
             del model
@@ -1088,32 +2520,205 @@ def api_benchmark(dataset_name: str, req: BenchmarkRequest):
                 torch.cuda.empty_cache()
 
         elapsed = time.time() - t0
-        mean_mask = float(np.mean(mask_ious)) if mask_ious else None
+        mean_mask = float(np.mean(mask_scores)) if mask_scores else None
         mean_class = float(np.mean(class_recalls)) if class_recalls else None
-        mean_crit = float(np.mean(critical_iou_values)) if critical_iou_values else None
+        mean_crit = float(np.mean(critical_coverage_values)) if critical_coverage_values else None
+        mean_false_positive = float(np.mean(false_positive_ratios)) if false_positive_ratios else 0.0
+        penalty_info = benchmark_penalty(mean_crit, mean_false_positive)
+
         results.append({
             "model": model_name,
-            "score": round(composite_from_means(mean_mask, mean_class, mean_crit), 2),
+            "score": round(penalty_info["score"], 2),
+            "penalty": round(penalty_info["penalty"], 4),
+            "penalty_points": round(penalty_info["penalty_points"], 2),
+            "critical_miss_penalty": round(penalty_info["critical_miss_penalty"], 2),
+            "false_positive_penalty": round(penalty_info["false_positive_penalty"], 2),
             "mean_iou": round(mean_mask, 4) if mean_mask is not None else 0.0,
-            "median_iou": round(float(np.median(mask_ious)), 4) if mask_ious else 0.0,
+            "raw_iou": round(float(np.mean(raw_ious)), 4) if raw_ious else 0.0,
+            "mask_coverage": round(float(np.mean(mask_coverages)), 4) if mask_coverages else 0.0,
+            "overreach": round(mean_false_positive, 4),
+            "undercoverage": round(float(np.mean(undercoverage_penalties)), 4) if undercoverage_penalties else 0.0,
+            "median_iou": round(float(np.median(mask_scores)), 4) if mask_scores else 0.0,
             "class_recall": round(mean_class, 4) if mean_class is not None else None,
             "critical_iou": round(mean_crit, 4) if mean_crit is not None else None,
-            "image_count": len(mask_ious),
+            "image_count": len(mask_scores),
             "elapsed_sec": round(elapsed, 2),
+            "batch_size": current_batch_size,
         })
+        model_caches[model_name] = model_predictions
+
+        set_benchmark_progress(
+            m_idx + 1,
+            total_models,
+            elapsed,
+            phase="models",
+            message=f"Models {m_idx + 1}/{total_models} · batch {current_batch_size}",
+            phase_started_at=model_phase_started_at,
+        )
 
     results.sort(key=lambda r: r.get("score", 0.0), reverse=True)
+
+    # Evaluate 2-model combinations
+    import itertools
+    combo_results = []
+    combo_min_score = 80.0
+    combo_max_penalty = 0.05
+    combo_rank_limit = 80
+    result_by_model = {r.get("model"): r for r in results}
+    valid_models = []
+    for ranked_result in results[:combo_rank_limit]:
+        model_name = ranked_result.get("model")
+        result = result_by_model.get(model_name) or {}
+        if (
+            model_name in model_caches
+            and len(model_caches[model_name]) == len(image_paths)
+            and float(result.get("score") or 0.0) >= combo_min_score
+            and float(result.get("penalty") if result.get("penalty") is not None else 1.0) <= combo_max_penalty
+        ):
+            valid_models.append(model_name)
+
+    combo_pairs = list(itertools.combinations(valid_models, 2))
+    combo_phase_started_at = time.time()
+    if combo_pairs:
+        print(
+            f"[benchmark] combinations using packed popcount: models={len(valid_models)} pairs={len(combo_pairs)}",
+            flush=True,
+        )
+        set_benchmark_progress(
+            0,
+            len(combo_pairs),
+            phase="combinations",
+            message=f"Combinations 0/{len(combo_pairs)}",
+            phase_started_at=combo_phase_started_at,
+        )
+    if len(combo_pairs) > 0:
+        for combo_idx, (modelA_name, modelB_name) in enumerate(combo_pairs):
+            combo_t0 = time.time()
+            cache_A = model_caches[modelA_name]
+            cache_B = model_caches[modelB_name]
+
+            combo_mask_scores = []
+            combo_raw_ious = []
+            combo_coverages = []
+            combo_undercoverage_penalties = []
+            combo_false_positive_ratios = []
+            combo_class_recalls = []
+            combo_critical_coverages = []
+
+            for idx in range(len(image_paths)):
+                pred_A = cache_A[idx]
+                pred_B = cache_B[idx]
+
+                # 1. Combined overall coverage-first mask score.
+                # Keep masks bit-packed: OR/AND + byte popcount is much faster
+                # than unpacking every pair to a 640x640 bool array.
+                gt_info = gt_mask_cache[idx]
+                comb_overall = np.bitwise_or(pred_A["overall"], pred_B["overall"])
+                combo_metric = packed_coverage_score(
+                    gt_info["overall"],
+                    gt_info["overall_area"],
+                    comb_overall,
+                )
+                combo_mask_scores.append(float(combo_metric["score"]))
+                combo_raw_ious.append(float(combo_metric["iou"]))
+                combo_coverages.append(float(combo_metric["coverage"]))
+                combo_undercoverage_penalties.append(float(combo_metric["under_penalty"]))
+                combo_false_positive_ratios.append(float(combo_metric["false_positive_ratio"]))
+
+                # 2. Combined class recall
+                comb_cls_set = pred_A["class_set"] | pred_B["class_set"]
+                gt_cls = gt_class_sets[idx]
+                if gt_cls:
+                    matched = gt_cls & comb_cls_set
+                    combo_class_recalls.append(len(matched) / len(gt_cls))
+
+                # 3. Combined critical coverage
+                per_img_critical = []
+                for cid in critical_ids:
+                    gt_crit_info = gt_info["critical"].get(cid)
+                    if gt_crit_info is None:
+                        continue
+
+                    packed_mask_A = pred_A["critical"].get(cid)
+                    packed_mask_B = pred_B["critical"].get(cid)
+
+                    if packed_mask_A is None and packed_mask_B is None:
+                        pr_m = None
+                    elif packed_mask_A is not None and packed_mask_B is None:
+                        pr_m = packed_mask_A
+                    elif packed_mask_A is None and packed_mask_B is not None:
+                        pr_m = packed_mask_B
+                    else:
+                        pr_m = np.bitwise_or(packed_mask_A, packed_mask_B)
+
+                    crit_score = packed_critical_coverage(gt_crit_info, pr_m)
+                    if crit_score is not None:
+                        per_img_critical.append(float(crit_score))
+
+                if per_img_critical:
+                    combo_critical_coverages.append(float(np.mean(per_img_critical)))
+
+            mean_mask = float(np.mean(combo_mask_scores)) if combo_mask_scores else None
+            mean_class = float(np.mean(combo_class_recalls)) if combo_class_recalls else None
+            mean_crit = float(np.mean(combo_critical_coverages)) if combo_critical_coverages else None
+            mean_false_positive = float(np.mean(combo_false_positive_ratios)) if combo_false_positive_ratios else 0.0
+            penalty_info = benchmark_penalty(mean_crit, mean_false_positive)
+
+            combo_results.append({
+                "model_a": modelA_name,
+                "model_b": modelB_name,
+                "score": round(penalty_info["score"], 2),
+                "penalty": round(penalty_info["penalty"], 4),
+                "penalty_points": round(penalty_info["penalty_points"], 2),
+                "critical_miss_penalty": round(penalty_info["critical_miss_penalty"], 2),
+                "false_positive_penalty": round(penalty_info["false_positive_penalty"], 2),
+                "mean_iou": round(mean_mask, 4) if mean_mask is not None else 0.0,
+                "raw_iou": round(float(np.mean(combo_raw_ious)), 4) if combo_raw_ious else 0.0,
+                "mask_coverage": round(float(np.mean(combo_coverages)), 4) if combo_coverages else 0.0,
+                "overreach": round(mean_false_positive, 4),
+                "undercoverage": round(float(np.mean(combo_undercoverage_penalties)), 4) if combo_undercoverage_penalties else 0.0,
+                "class_recall": round(mean_class, 4) if mean_class is not None else None,
+                "critical_iou": round(mean_crit, 4) if mean_crit is not None else None,
+            })
+            set_benchmark_progress(
+                combo_idx + 1,
+                len(combo_pairs),
+                time.time() - combo_t0,
+                phase="combinations",
+                message=f"Combinations {combo_idx + 1}/{len(combo_pairs)}",
+                phase_started_at=combo_phase_started_at,
+            )
+
+        # Sort combinations by composite score descending
+        combo_results.sort(key=lambda x: x["score"], reverse=True)
 
     payload = {
         "status": "ok",
         "split": req.split,
         "image_count": len(image_paths),
         "device": "cuda" if use_cuda else "cpu",
+        "batch_size": benchmark_batch_size,
         "ran_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "weights": {"mask": w_mask, "class": w_class, "critical": w_critical},
+        "scoring": {
+            "mode": "penalty_points",
+            "base_score": 100.0,
+            "critical_miss_max_points": CRITICAL_MISS_MAX_POINTS,
+            "false_positive_max_points": FALSE_POSITIVE_MAX_POINTS,
+        },
         "critical_classes_used": critical_names_used,
         "critical_classes_requested": list(req.critical_classes),
+        "ignored_classes_used": ignored_names_used,
+        "ignored_classes_requested": list(req.ignored_classes),
+        "combination_filter": {
+            "min_score": combo_min_score,
+            "max_penalty": combo_max_penalty,
+            "rank_limit": combo_rank_limit,
+            "backend": "packed_popcount",
+            "eligible_models": valid_models,
+            "pair_count": len(combo_pairs),
+        },
         "results": results,
+        "combinations": combo_results,
     }
 
     bench_file = DATASETS_DIR / dataset_name / "benchmark.json"
@@ -1122,6 +2727,17 @@ def api_benchmark(dataset_name: str, req: BenchmarkRequest):
             json.dump(payload, f)
     except Exception:
         pass
+
+    final_total = len(combo_pairs) if combo_pairs else total_models
+    final_current = final_total
+    set_benchmark_progress(
+        final_current,
+        final_total,
+        phase="done",
+        message="Benchmark complete",
+        phase_started_at=combo_phase_started_at if combo_pairs else model_phase_started_at,
+        status="done",
+    )
 
     return payload
 
@@ -1158,9 +2774,11 @@ def api_auto_split(dataset_name: str, req: AutoSplitRequest):
                 if img_file.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]:
                      labels_dir = DATASETS_DIR / dataset_name / split / "labels"
                      label_file = labels_dir / (img_file.stem + ".txt")
+                     coco_file = _multipolygon_path_for_image(img_file)
                      all_images.append({
                          "img_path": img_file,
-                         "label_path": label_file if label_file.exists() else None
+                         "label_path": label_file if label_file.exists() else None,
+                         "coco_label_path": coco_file if coco_file.exists() else None,
                      })
 
     # Shuffle
@@ -1177,13 +2795,17 @@ def api_auto_split(dataset_name: str, req: AutoSplitRequest):
     def move_files(imgs, target_split):
         img_dest_dir = DATASETS_DIR / dataset_name / target_split / "images"
         lbl_dest_dir = DATASETS_DIR / dataset_name / target_split / "labels"
+        coco_dest_dir = DATASETS_DIR / dataset_name / target_split / MULTIPOLYGON_LABEL_DIR
         img_dest_dir.mkdir(parents=True, exist_ok=True)
         lbl_dest_dir.mkdir(parents=True, exist_ok=True)
+        coco_dest_dir.mkdir(parents=True, exist_ok=True)
         
         for item in imgs:
             shutil.move(str(item["img_path"]), str(img_dest_dir / item["img_path"].name))
             if item["label_path"]:
                 shutil.move(str(item["label_path"]), str(lbl_dest_dir / item["label_path"].name))
+            if item["coco_label_path"]:
+                shutil.move(str(item["coco_label_path"]), str(coco_dest_dir / item["coco_label_path"].name))
 
     move_files(train_imgs, "train")
     if valid_imgs: move_files(valid_imgs, "valid")
@@ -1219,12 +2841,15 @@ async def api_move_image(dataset_name: str, req: MoveImageRequest):
         return {"status": "ok", "message": "Already in target split"}
         
     label_path = physical_img_path.parent.parent / "labels" / (physical_img_path.stem + ".txt")
+    coco_label_path = _multipolygon_path_for_image(physical_img_path)
     
     img_dest_dir = DATASETS_DIR / dataset_name / req.target_split / "images"
     lbl_dest_dir = DATASETS_DIR / dataset_name / req.target_split / "labels"
+    coco_dest_dir = DATASETS_DIR / dataset_name / req.target_split / MULTIPOLYGON_LABEL_DIR
     
     img_dest_dir.mkdir(parents=True, exist_ok=True)
     lbl_dest_dir.mkdir(parents=True, exist_ok=True)
+    coco_dest_dir.mkdir(parents=True, exist_ok=True)
     
     new_img_path = img_dest_dir / physical_img_path.name
     shutil.move(str(physical_img_path), str(new_img_path))
@@ -1232,6 +2857,9 @@ async def api_move_image(dataset_name: str, req: MoveImageRequest):
     if label_path.exists():
         new_lbl_path = lbl_dest_dir / label_path.name
         shutil.move(str(label_path), str(new_lbl_path))
+    if coco_label_path.exists():
+        new_coco_path = coco_dest_dir / coco_label_path.name
+        shutil.move(str(coco_label_path), str(new_coco_path))
         
     return {
         "status": "ok",
@@ -1265,7 +2893,8 @@ async def api_move_unlabeled_to_pending(dataset_name: str):
             if img_file.name in negatives:
                 continue
             lbl_file = labels_dir / (img_file.stem + ".txt")
-            if lbl_file.exists() and lbl_file.stat().st_size > 0:
+            coco_file = _multipolygon_path_for_image(img_file)
+            if _label_has_segmentation_annotations(lbl_file):
                 continue
             dest_path = dest_img_dir / img_file.name
             if dest_path.exists():
@@ -1275,9 +2904,88 @@ async def api_move_unlabeled_to_pending(dataset_name: str):
                 shutil.move(str(img_file), str(dest_path))
             if lbl_file.exists():
                 lbl_file.unlink()
+            if coco_file.exists():
+                coco_file.unlink()
             moved += 1
 
     return {"status": "ok", "moved": moved}
+
+@app.post("/api/dataset/{dataset_name}/move_pending_labeled_to_test")
+async def api_move_pending_labeled_to_test(dataset_name: str):
+    """Bulk-move completed pending images into the test split.
+
+    Images are considered complete when they either have at least one valid
+    YOLO segmentation annotation line, or are explicitly marked as negative
+    samples. Empty unfinished labels remain pending.
+    """
+    if not (DATASETS_DIR / dataset_name).exists():
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    negatives = load_negative_samples(dataset_name)
+    auto_unreviewed = load_auto_labeled_unreviewed(dataset_name)
+    src_img_dir = DATASETS_DIR / dataset_name / PENDING_SPLIT / "images"
+    src_lbl_dir = DATASETS_DIR / dataset_name / PENDING_SPLIT / "labels"
+    src_coco_dir = DATASETS_DIR / dataset_name / PENDING_SPLIT / MULTIPOLYGON_LABEL_DIR
+    dest_img_dir = DATASETS_DIR / dataset_name / "test" / "images"
+    dest_lbl_dir = DATASETS_DIR / dataset_name / "test" / "labels"
+    dest_coco_dir = DATASETS_DIR / dataset_name / "test" / MULTIPOLYGON_LABEL_DIR
+    dest_img_dir.mkdir(parents=True, exist_ok=True)
+    dest_lbl_dir.mkdir(parents=True, exist_ok=True)
+    dest_coco_dir.mkdir(parents=True, exist_ok=True)
+
+    moved = 0
+    duplicates = 0
+    skipped_unreviewed = 0
+    if not src_img_dir.exists():
+        return {"status": "ok", "moved": moved, "duplicates": duplicates, "skipped_unreviewed": skipped_unreviewed}
+
+    for img_file in list(src_img_dir.glob("*.*")):
+        if img_file.suffix.lower() not in IMAGE_EXTS:
+            continue
+        if img_file.name in auto_unreviewed:
+            skipped_unreviewed += 1
+            continue
+        lbl_file = src_lbl_dir / (img_file.stem + ".txt")
+        coco_file = src_coco_dir / (img_file.stem + ".json")
+        is_negative = img_file.name in negatives
+        has_annotations = _label_has_segmentation_annotations(lbl_file)
+        if not is_negative and not has_annotations:
+            continue
+
+        dest_img_path = dest_img_dir / img_file.name
+        dest_lbl_path = dest_lbl_dir / lbl_file.name
+        dest_coco_path = dest_coco_dir / coco_file.name
+        has_label_file = lbl_file.exists()
+        has_coco_file = coco_file.exists()
+        if dest_img_path.exists() and (not has_label_file or dest_lbl_path.exists()) and (not has_coco_file or dest_coco_path.exists()):
+            # Avoid overwriting an existing test sample. With normalized hashed
+            # filenames this is normally the same image, so remove pending copy.
+            img_file.unlink()
+            if has_label_file:
+                lbl_file.unlink()
+            if has_coco_file:
+                coco_file.unlink()
+            duplicates += 1
+            continue
+
+        if dest_img_path.exists():
+            img_file.unlink()
+        else:
+            shutil.move(str(img_file), str(dest_img_path))
+
+        if has_label_file:
+            if dest_lbl_path.exists():
+                lbl_file.unlink()
+            else:
+                shutil.move(str(lbl_file), str(dest_lbl_path))
+        if has_coco_file:
+            if dest_coco_path.exists():
+                coco_file.unlink()
+            else:
+                shutil.move(str(coco_file), str(dest_coco_path))
+        moved += 1
+
+    return {"status": "ok", "moved": moved, "duplicates": duplicates, "skipped_unreviewed": skipped_unreviewed}
 
 class CreateDatasetRequest(BaseModel):
     dataset_name: str
@@ -1295,6 +3003,7 @@ async def api_create_dataset(req: CreateDatasetRequest):
     for split in ["train", "valid", "test", PENDING_SPLIT]:
         (ds_dir / split / "images").mkdir(parents=True, exist_ok=True)
         (ds_dir / split / "labels").mkdir(parents=True, exist_ok=True)
+        (ds_dir / split / MULTIPOLYGON_LABEL_DIR).mkdir(parents=True, exist_ok=True)
         
     yaml_path = ds_dir / "data.yaml"
     with open(yaml_path, "w", encoding="utf-8") as f:
@@ -1404,9 +3113,50 @@ def _clip_labels_in_dataset(dataset_name: str) -> dict:
 
     for split in ALL_SPLITS:
         labels_dir = DATASETS_DIR / dataset_name / split / "labels"
+        coco_dir = DATASETS_DIR / dataset_name / split / MULTIPOLYGON_LABEL_DIR
+
+        if coco_dir.exists():
+            for coco_file in coco_dir.glob("*.json"):
+                label_file = labels_dir / f"{coco_file.stem}.txt"
+                try:
+                    polygons = _read_multipolygon_label(coco_file)
+                except Exception:
+                    continue
+
+                file_changed = False
+                new_polygons = []
+                for poly in polygons:
+                    pts = [(pt["x"], pt["y"]) for pt in poly["points"]]
+                    has_oob = any(x < 0.0 or x > 1.0 or y < 0.0 or y > 1.0 for x, y in pts)
+                    if not has_oob:
+                        new_polygons.append(poly)
+                        continue
+
+                    clipped = _clip_polygon_to_unit_square(pts)
+                    file_changed = True
+                    if len(clipped) < 3:
+                        polygons_dropped += 1
+                        continue
+                    polygons_clipped += 1
+                    new_polygons.append({
+                        "labelId": poly["labelId"],
+                        "classId": poly["classId"],
+                        "points": [
+                            {"x": max(0.0, min(1.0, x)), "y": max(0.0, min(1.0, y))}
+                            for x, y in clipped
+                        ],
+                    })
+
+                if file_changed:
+                    _write_multipolygon_label(coco_file, new_polygons)
+                    _write_yolo_label_from_polygons(label_file, new_polygons)
+                    files_modified += 1
+
         if not labels_dir.exists():
             continue
         for lbl_file in labels_dir.glob("*.txt"):
+            if _multipolygon_path_for_label(lbl_file).exists():
+                continue
             file_changed = False
             new_lines = []
             try:
@@ -1490,6 +3240,17 @@ async def api_normalize_filenames(dataset_name: str):
     if not (DATASETS_DIR / dataset_name).exists():
         raise HTTPException(status_code=404, detail="Dataset not found")
 
+    progress_key = f"reload_{dataset_name}"
+    t0 = time.time()
+    PROGRESS_CACHE[progress_key] = {
+        "status": "running",
+        "current": 0,
+        "total": 0,
+        "last_duration": 0.0,
+        "phase": "normalize",
+        "message": "Normalizing filenames...",
+    }
+
     seen_hashes = {}     # hash_stem -> final Path of the kept image
     rename_map = {}      # old image filename -> new image filename
     renamed = 0
@@ -1500,6 +3261,7 @@ async def api_normalize_filenames(dataset_name: str):
     for split in ALL_SPLITS:
         images_dir = DATASETS_DIR / dataset_name / split / "images"
         labels_dir = DATASETS_DIR / dataset_name / split / "labels"
+        coco_dir = DATASETS_DIR / dataset_name / split / MULTIPOLYGON_LABEL_DIR
         if not images_dir.exists():
             continue
 
@@ -1517,22 +3279,28 @@ async def api_normalize_filenames(dataset_name: str):
 
             new_suffix = img_file.suffix.lower()
             old_label = labels_dir / f"{img_file.stem}.txt"
+            old_coco = coco_dir / f"{img_file.stem}.json"
 
             if hash_stem in seen_hashes:
                 img_file.unlink()
                 if old_label.exists():
                     old_label.unlink()
+                if old_coco.exists():
+                    old_coco.unlink()
                 deleted_dup += 1
                 continue
 
             new_img_path = images_dir / f"{hash_stem}{new_suffix}"
             new_label = labels_dir / f"{hash_stem}.txt"
+            new_coco = coco_dir / f"{hash_stem}.json"
 
             if new_img_path != img_file:
                 if new_img_path.exists():
                     img_file.unlink()
                     if old_label.exists():
                         old_label.unlink()
+                    if old_coco.exists():
+                        old_coco.unlink()
                     deleted_dup += 1
                     continue
                 img_file.rename(new_img_path)
@@ -1541,6 +3309,12 @@ async def api_normalize_filenames(dataset_name: str):
                         old_label.unlink()
                     else:
                         old_label.rename(new_label)
+                if old_coco.exists():
+                    coco_dir.mkdir(parents=True, exist_ok=True)
+                    if new_coco.exists():
+                        old_coco.unlink()
+                    else:
+                        old_coco.rename(new_coco)
                 rename_map[old_name] = new_img_path.name
                 renamed += 1
 
@@ -1550,7 +3324,8 @@ async def api_normalize_filenames(dataset_name: str):
     for split in ALL_SPLITS:
         images_dir = DATASETS_DIR / dataset_name / split / "images"
         labels_dir = DATASETS_DIR / dataset_name / split / "labels"
-        if not labels_dir.exists():
+        coco_dir = DATASETS_DIR / dataset_name / split / MULTIPOLYGON_LABEL_DIR
+        if not labels_dir.exists() and not coco_dir.exists():
             continue
 
         image_stems = set()
@@ -1559,10 +3334,16 @@ async def api_normalize_filenames(dataset_name: str):
                 if img_file.suffix.lower() in IMAGE_EXTS:
                     image_stems.add(img_file.stem)
 
-        for lbl_file in list(labels_dir.glob("*.txt")):
-            if lbl_file.stem not in image_stems:
-                lbl_file.unlink()
-                deleted_orphan += 1
+        if labels_dir.exists():
+            for lbl_file in list(labels_dir.glob("*.txt")):
+                if lbl_file.stem not in image_stems:
+                    lbl_file.unlink()
+                    deleted_orphan += 1
+        if coco_dir.exists():
+            for coco_file in list(coco_dir.glob("*.json")):
+                if coco_file.stem not in image_stems:
+                    coco_file.unlink()
+                    deleted_orphan += 1
 
     # Update auto_check.json keys to follow renames; drop entries for removed images.
     scores_file = DATASETS_DIR / dataset_name / "auto_check.json"
@@ -1592,12 +3373,128 @@ async def api_normalize_filenames(dataset_name: str):
         if new_negatives != negatives:
             save_negative_samples(dataset_name, new_negatives)
 
+    auto_unreviewed = load_auto_labeled_unreviewed(dataset_name)
+    if auto_unreviewed:
+        new_auto_unreviewed = set()
+        for name in auto_unreviewed:
+            mapped = rename_map.get(name, name)
+            if mapped in current_image_names:
+                new_auto_unreviewed.add(mapped)
+        if new_auto_unreviewed != auto_unreviewed:
+            save_auto_labeled_unreviewed(dataset_name, new_auto_unreviewed)
+
+    tag_result = {"tagged": 0, "missing_before": 0, "errors": []}
+    try:
+        current_image_items = []
+        for img_path in seen_hashes.values():
+            try:
+                split = img_path.parent.parent.name
+            except Exception:
+                split = ""
+            if split in ALL_SPLITS and img_path.exists():
+                current_image_items.append((split, img_path))
+
+        def update_reload_tag_progress(current, total, message):
+            PROGRESS_CACHE[progress_key] = {
+                "status": "running",
+                "current": int(current),
+                "total": int(total),
+                "last_duration": time.time() - t0,
+                "phase": "tagging",
+                "message": message,
+            }
+
+        tag_result = tag_missing_images(
+            DATASETS_DIR / dataset_name,
+            current_image_items,
+            BASE_DIR,
+            progress_callback=update_reload_tag_progress,
+        )
+    except Exception as e:
+        tag_result = {"tagged": 0, "missing_before": 0, "errors": [{"error": str(e)}]}
+        PROGRESS_CACHE[progress_key] = {
+            "status": "error",
+            "current": 0,
+            "total": 0,
+            "last_duration": time.time() - t0,
+            "phase": "tagging",
+            "message": str(e),
+        }
+    else:
+        PROGRESS_CACHE[progress_key] = {
+            "status": "done",
+            "current": int(tag_result.get("missing_before", 0)),
+            "total": int(tag_result.get("missing_before", 0)),
+            "last_duration": time.time() - t0,
+            "phase": "done",
+            "message": f"Reload complete. Tagged {int(tag_result.get('tagged', 0))}/{int(tag_result.get('missing_before', 0))} image(s).",
+        }
+
     return {
         "status": "ok",
         "renamed": renamed,
         "deleted_duplicates": deleted_dup,
         "deleted_orphans": deleted_orphan,
+        "tagging": tag_result,
     }
+
+
+class TagSearchRequest(BaseModel):
+    positive_tags: List[str] = []
+    negative_tags: List[str] = []
+    split: str = "all"
+    limit: int = 500
+
+
+@app.post("/api/dataset/{dataset_name}/tag_search")
+async def api_tag_search(dataset_name: str, req: TagSearchRequest):
+    dataset_dir = DATASETS_DIR / dataset_name
+    if not dataset_dir.exists():
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    if req.split not in set(ALL_SPLITS + ["all"]):
+        raise HTTPException(status_code=400, detail="Invalid split")
+
+    positive = []
+    for tag in req.positive_tags:
+        positive.extend(split_tags(tag))
+    negative = []
+    for tag in req.negative_tags:
+        negative.extend(split_tags(tag))
+
+    db = TagSearchDatabase(dataset_dir)
+    db.sync_current_images(current_dataset_image_items(dataset_name))
+    rows = db.search(positive, negative, split=req.split, limit=max(1, min(int(req.limit), 2000)))
+    filenames = [row["filename"] for row in rows]
+    tags_by_name = db.tags_for_filenames(filenames, limit_per_image=24)
+
+    results = []
+    for row in rows:
+        path = Path(row["filepath"])
+        try:
+            split = row["split"] or path.parent.parent.name
+        except Exception:
+            split = row["split"]
+        results.append({
+            "id": row["id"],
+            "filename": row["filename"],
+            "split": split,
+            "image_path": f"/datasets/{dataset_name}/{split}/images/{row['filename']}",
+            "match_count": row["match_count"],
+            "avg_confidence": row["avg_confidence"],
+            "tags": tags_by_name.get(row["filename"], []),
+        })
+
+    return {"status": "ok", "results": results, "total_count": len(results)}
+
+
+@app.get("/api/dataset/{dataset_name}/tag_suggestions")
+async def api_tag_suggestions(dataset_name: str, q: str = "", limit: int = 30):
+    dataset_dir = DATASETS_DIR / dataset_name
+    if not dataset_dir.exists():
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    db = TagSearchDatabase(dataset_dir)
+    return {"items": db.suggestions(q, limit=max(1, min(int(limit), 100)))}
+
 
 class ToggleNegativeRequest(BaseModel):
     image_filename: str
@@ -1620,6 +3517,7 @@ async def api_toggle_negative(dataset_name: str, req: ToggleNegativeRequest):
     negatives = load_negative_samples(dataset_name)
     if req.value:
         negatives.add(req.image_filename)
+        clear_auto_labeled_unreviewed(dataset_name, req.image_filename)
     else:
         negatives.discard(req.image_filename)
     save_negative_samples(dataset_name, negatives)
@@ -1654,17 +3552,21 @@ async def api_delete_image(dataset_name: str, req: DeleteImageRequest):
         # Determine the label file
         label_filename = os.path.splitext(filename)[0] + ".txt"
         lbl_file = DATASETS_DIR / dataset_name / split / "labels" / label_filename
+        coco_file = DATASETS_DIR / dataset_name / split / MULTIPOLYGON_LABEL_DIR / (os.path.splitext(filename)[0] + ".json")
         
         if img_file.exists():
             img_file.unlink()
 
         if lbl_file.exists():
             lbl_file.unlink()
+        if coco_file.exists():
+            coco_file.unlink()
 
         negatives = load_negative_samples(dataset_name)
         if filename in negatives:
             negatives.discard(filename)
             save_negative_samples(dataset_name, negatives)
+        clear_auto_labeled_unreviewed(dataset_name, filename)
 
         return {"status": "ok"}
     except Exception as e:
@@ -1674,6 +3576,7 @@ async def api_delete_image(dataset_name: str, req: DeleteImageRequest):
 @app.get("/api/dataset/{dataset_name}/next_unlabeled")
 async def api_next_unlabeled(dataset_name: str):
     negatives = load_negative_samples(dataset_name)
+    auto_unreviewed = load_auto_labeled_unreviewed(dataset_name)
     # Scan splits in order for an image without a label file
     for split in ALL_SPLITS:
         images_dir = DATASETS_DIR / dataset_name / split / "images"
@@ -1686,7 +3589,7 @@ async def api_next_unlabeled(dataset_name: str):
                 if img_file.name in negatives:
                     continue
                 label_file = labels_dir / (img_file.stem + ".txt")
-                if not label_file.exists() or label_file.stat().st_size == 0:
+                if img_file.name in auto_unreviewed or not label_file.exists() or label_file.stat().st_size == 0:
                     return {
                         "status": "ok",
                         "next_image": f"/datasets/{dataset_name}/{split}/images/{img_file.name}",
@@ -1903,5 +3806,3 @@ except ImportError:
     pass
 except Exception as e:
     print(f"hooks_local failed to initialize: {e}")
-
-

@@ -10,6 +10,16 @@
         </svg>
         <span id="reload-btn-text">Reload</span>
     </button>
+    <div id="reload-progress" class="hidden w-64">
+        <div class="flex justify-between text-[10px] text-slate-300 mb-1">
+            <span id="reload-progress-label">Reload</span>
+            <span id="reload-progress-count">0/0</span>
+        </div>
+        <div class="h-2 rounded bg-slate-800 border border-slate-700 overflow-hidden">
+            <div id="reload-progress-bar" class="h-full w-0 bg-cyan-500 transition-all duration-300"></div>
+        </div>
+        <div id="reload-progress-message" class="mt-1 text-[10px] text-slate-400 truncate"></div>
+    </div>
     <a href="/"
         class="px-4 py-2 text-sm font-medium rounded-lg bg-slate-800 text-slate-300 hover:bg-slate-700 hover:text-white transition-colors border border-slate-700 flex items-center">
         &larr; Back to Datasets
@@ -170,6 +180,17 @@
                     Unlabeled → Pending
                 </button>
 
+                <button id="move-pending-labeled-btn" onclick="submitMovePendingLabeledToTest()"
+                    class="w-full bg-teal-700 hover:bg-teal-600 text-white font-medium py-2 px-4 rounded transition-colors flex justify-center items-center gap-2"
+                    title="Move pending images with completed segmentation labels or Negative marks into the Test split.">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24"
+                        stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M9 12l2 2 4-4m5 5V5a2 2 0 00-2-2H6a2 2 0 00-2 2v10m16 0l-4-4m4 4l-4 4M4 15l4-4m-4 4l4 4" />
+                    </svg>
+                    Pending Labeled/Negative → Test
+                </button>
+
                 <button onclick="document.getElementById('auto-split-modal').classList.remove('hidden')"
                     class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2 px-4 rounded transition-colors flex justify-center items-center gap-2"
                     title="Auto Split only shuffles train/valid/test — Pending images are left alone.">
@@ -224,6 +245,25 @@
                             </svg>
                             Auto Check
                         </button>
+                        <div class="grid grid-cols-1 gap-2 pt-2 border-t border-slate-700/60">
+                            <select id="auto-label-model-a"
+                                class="w-full bg-slate-900 border border-slate-700 rounded px-2 py-2 text-sm text-slate-300 focus:outline-none focus:border-emerald-500">
+                                <option value="">Auto Label Model A...</option>
+                            </select>
+                            <select id="auto-label-model-b"
+                                class="w-full bg-slate-900 border border-slate-700 rounded px-2 py-2 text-sm text-slate-300 focus:outline-none focus:border-emerald-500">
+                                <option value="">Auto Label Model B...</option>
+                            </select>
+                            <button id="auto-label-pending-btn" onclick="submitAutoLabelPending()"
+                                class="w-full bg-emerald-700 hover:bg-emerald-600 text-white font-medium py-2 px-4 rounded transition-colors flex justify-center items-center gap-2">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24"
+                                    stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                        d="M13 10V3L4 14h7v7l9-11h-7z" />
+                                </svg>
+                                Auto Label Pending
+                            </button>
+                        </div>
                     </div>
                 </div>
 
@@ -237,9 +277,9 @@
                         </div>
                         <div class="flex gap-2 items-center">
                             <button onclick="benchmarkSelectAll(true)"
-                                class="flex-1 text-[10px] text-slate-400 hover:text-indigo-300 transition-colors">Select all</button>
+                                class="flex-1 rounded border border-cyan-600/50 bg-cyan-950/40 px-2 py-1.5 text-[10px] font-semibold text-cyan-200 hover:bg-cyan-900/60 transition-colors">Select All Models</button>
                             <button onclick="benchmarkSelectAll(false)"
-                                class="flex-1 text-[10px] text-slate-400 hover:text-indigo-300 transition-colors">Clear</button>
+                                class="flex-1 rounded border border-slate-700 bg-slate-900 px-2 py-1.5 text-[10px] font-semibold text-slate-300 hover:bg-slate-800 transition-colors">Clear Selection</button>
                         </div>
                         <select id="benchmark-split"
                             class="w-full bg-slate-900 border border-slate-700 rounded px-2 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500">
@@ -248,6 +288,11 @@
                             <option value="train">Train split</option>
                             <option value="all">All splits</option>
                         </select>
+                        <label class="flex items-center justify-between gap-2 rounded border border-slate-700 bg-slate-900 px-2 py-1.5 text-[10px] text-slate-400">
+                            <span class="font-semibold uppercase tracking-wider">Batch</span>
+                            <input id="benchmark-batch-size" type="number" min="1" max="64" step="1" value="8"
+                                class="w-16 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-right text-xs text-slate-200 focus:outline-none focus:border-cyan-500">
+                        </label>
                         <button id="benchmark-run-btn" onclick="submitBenchmark()"
                             class="w-full bg-cyan-600 hover:bg-cyan-500 disabled:opacity-60 text-white font-medium py-2 px-4 rounded transition-colors flex justify-center items-center gap-2">
                             <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24"
@@ -257,6 +302,16 @@
                             </svg>
                             <span id="benchmark-run-btn-text">Run Benchmark</span>
                         </button>
+                        <div id="benchmark-progress" class="hidden rounded border border-cyan-700/40 bg-cyan-950/20 p-2 text-[10px] text-slate-300">
+                            <div class="flex items-center justify-between gap-2">
+                                <span id="benchmark-progress-label" class="font-semibold uppercase tracking-wider text-cyan-200">Benchmark</span>
+                                <span id="benchmark-progress-count" class="text-slate-400">0/0</span>
+                            </div>
+                            <div class="mt-1 h-1.5 w-full overflow-hidden rounded bg-slate-800">
+                                <div id="benchmark-progress-bar" class="h-full w-0 bg-cyan-500 transition-all duration-300"></div>
+                            </div>
+                            <div id="benchmark-progress-message" class="mt-1 truncate text-slate-400"></div>
+                        </div>
                         <div id="benchmark-results" class="hidden mt-2">
                             <div class="flex justify-between items-baseline mb-1">
                                 <h4 class="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Ranking</h4>
@@ -267,15 +322,33 @@
                                     <tr class="text-slate-400 border-b border-slate-700">
                                         <th class="text-left py-1 font-medium">#</th>
                                         <th class="text-left py-1 font-medium">Model</th>
-                                        <th class="text-right py-1 font-medium" title="Composite score (0-100): weighted sum of mask IoU, class recall, and critical-class IoU">Score</th>
-                                        <th class="text-right py-1 font-medium" title="Overall mask IoU (any class union)">mIoU</th>
+                                        <th class="text-right py-1 font-medium" title="Score = 100 minus critical-miss penalty and GT-outside false-positive penalty.">Score</th>
+                                        <th class="text-right py-1 font-medium" title="Overall GT coverage. Extra coverage is not penalized here.">Cover</th>
                                         <th class="text-right py-1 font-medium" title="Per-image fraction of GT classes that the model predicted at least once">Class</th>
-                                        <th class="text-right py-1 font-medium" title="IoU restricted to the critical classes (e.g. penis, pussy)">Crit</th>
+                                        <th class="text-right py-1 font-medium" title="GT coverage restricted to critical classes (penis, pussy, anus when present)">Crit</th>
                                         <th class="text-right py-1 font-medium">Time</th>
                                     </tr>
                                 </thead>
                                 <tbody id="benchmark-results-tbody"></tbody>
                             </table>
+                            <div id="benchmark-combos-section" class="hidden mt-3 pt-3 border-t border-slate-700">
+                                <div class="flex justify-between items-baseline mb-2">
+                                    <h4 class="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Best 2-Model Combination</h4>
+                                    <span id="benchmark-combos-meta" class="text-[10px] text-slate-500"></span>
+                                </div>
+                                <table class="w-full text-xs">
+                                    <thead>
+                                        <tr class="text-slate-400 border-b border-slate-700">
+                                            <th class="text-left py-1 font-medium">Combination</th>
+                                            <th class="text-right py-1 font-medium">Score</th>
+                                            <th class="text-right py-1 font-medium">Cover</th>
+                                            <th class="text-right py-1 font-medium">Class</th>
+                                            <th class="text-right py-1 font-medium">Crit</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="benchmark-combos-tbody"></tbody>
+                                </table>
+                            </div>
                             <p id="benchmark-weights" class="text-[10px] text-slate-500 mt-1"></p>
                         </div>
                     </div>
@@ -306,6 +379,8 @@
                     <option value="polymin_asc">Min Poly Points (Low-High)</option>
                     <option value="edge_desc">Near-Edge Score (High-Low)</option>
                     <option value="edge_asc">Near-Edge Score (Low-High)</option>
+                    <option value="overlap_desc">Mask Overlap (High-Low)</option>
+                    <option value="overlap_asc">Mask Overlap (Low-High)</option>
                 </select>
                 <select id="filter-status" onchange="runFilters()"
                     class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-indigo-500"
@@ -332,6 +407,17 @@
                     <option value="{{ loop.index0 }}">{{ cls }}</option>
                     {% endfor %}
                 </select>
+                <input id="tag-positive" type="text" placeholder="tags: 1girl, smile"
+                    class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-indigo-500 w-44"
+                    title="Positive tags. Comma-separated AND search.">
+                <input id="tag-negative" type="text" placeholder="exclude: censored"
+                    class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-indigo-500 w-40"
+                    title="Negative tags to exclude. Comma-separated.">
+                <button onclick="submitTagSearch()"
+                    class="bg-cyan-700 hover:bg-cyan-600 text-white px-2 py-1 text-xs rounded transition-colors border border-cyan-600"
+                    title="Search image tags stored by Reload">
+                    Tag Search
+                </button>
                 <button onclick="resetFilters()"
                     class="bg-slate-700 hover:bg-slate-600 text-slate-300 hover:text-white px-2 py-1 text-xs rounded transition-colors flex items-center gap-1 border border-slate-600"
                     title="Reset all filters">
@@ -351,11 +437,14 @@
                     data-name="{{ img.name }}" data-split="{{ img.split }}"
                     data-labeled="{{ 'true' if img.has_label else 'false' }}"
                     data-negative="{{ 'true' if img.is_negative else 'false' }}"
+                    data-unreviewed="{{ 'true' if img.is_auto_unreviewed else 'false' }}"
                     data-classes="{{ img.classes_present | join(',') }}"
                     data-duplicate="{{ 'true' if img.is_duplicate else 'false' }}" data-diff="{{ img.diff_score }}"
                     data-created="{{ img.created }}" data-modified="{{ img.modified }}"
                     data-total="{{ img.total_polygons }}" data-polymax="{{ img.max_polygon_points }}"
-                    data-polymin="{{ img.min_polygon_points }}" data-edge="{{ img.edge_score }}">
+                    data-polymin="{{ img.min_polygon_points }}" data-edge="{{ img.edge_score }}"
+                    data-overlap="{{ img.mask_overlap_score }}"
+                    data-tags="{{ img.tag_names | join(',') }}">
                     <img src="{{ img.path }}" alt="{{ img.name }}"
                         class="object-cover w-full h-full opacity-80 group-hover:opacity-100 transition-opacity"
                         loading="lazy">
@@ -363,7 +452,11 @@
                     <div class="absolute inset-x-0 bottom-0 bg-gradient-to-t from-slate-900 to-transparent p-3 pt-8">
                         <p class="text-xs text-white truncate font-medium drop-shadow-md">{{ img.name }}</p>
                         <div class="flex items-center mt-1">
-                            {% if img.has_label %}
+                            {% if img.is_auto_unreviewed %}
+                            <span
+                                class="w-2 h-2 rounded-full bg-amber-400 mr-1.5 shadow-[0_0_8px_rgba(251,191,36,0.75)]"></span>
+                            <span class="text-[10px] text-amber-300 font-medium" title="Auto-labeled and waiting for human review">Auto Review</span>
+                            {% elif img.has_label %}
                             <span
                                 class="w-2 h-2 rounded-full bg-emerald-500 mr-1.5 shadow-[0_0_8px_rgba(16,185,129,0.8)]"></span>
                             <span class="text-[10px] text-emerald-400 font-medium">Labeled</span>
@@ -390,7 +483,18 @@
                                 title="Polygon vertex is just inside the frame edge — may need to extend off-screen">Edge:
                                 {{ "%.2f"|format(img.edge_score) }}</span>
                             {% endif %}
+                            {% if img.mask_overlap_score > 0.5 %}
+                            <span
+                                class="ml-2 px-1 py-0.5 rounded bg-orange-500/20 text-[10px] text-orange-300 font-medium border border-orange-500/30"
+                                title="Same-class labels overlap strongly in this image">Overlap:
+                                {{ "%.2f"|format(img.mask_overlap_score) }}</span>
+                            {% endif %}
                         </div>
+                        {% if img.tag_names %}
+                        <p class="mt-1 text-[10px] text-cyan-200/80 truncate" title="{{ img.tag_names | join(', ') }}">
+                            {{ img.tag_names[:4] | join(', ') }}
+                        </p>
+                        {% endif %}
                     </div>
 
                     <select onclick="event.preventDefault();" onchange="moveImage('{{ img.path }}', this.value, this)"
@@ -469,13 +573,18 @@
     const datasetName = "{{ dataset_name }}";
 
     const STORAGE_KEY = `dataset_filters_${datasetName}`;
+    const BENCHMARK_SETTINGS_KEY = `dataset_benchmark_settings_${datasetName}`;
+    let activeTagResultNames = null;
+    let activeBenchmarkStopPolling = null;
 
     function saveFilterState() {
         const state = {
             sort: document.getElementById('sort-order').value,
             status: document.getElementById('filter-status').value,
             split: document.getElementById('filter-split').value,
-            cls: document.getElementById('filter-class').value
+            cls: document.getElementById('filter-class').value,
+            tagPositive: document.getElementById('tag-positive')?.value || '',
+            tagNegative: document.getElementById('tag-negative')?.value || ''
         };
         sessionStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     }
@@ -489,6 +598,8 @@
             if (state.status) document.getElementById('filter-status').value = state.status;
             if (state.split) document.getElementById('filter-split').value = state.split;
             if (state.cls) document.getElementById('filter-class').value = state.cls;
+            if (state.tagPositive && document.getElementById('tag-positive')) document.getElementById('tag-positive').value = state.tagPositive;
+            if (state.tagNegative && document.getElementById('tag-negative')) document.getElementById('tag-negative').value = state.tagNegative;
         } catch (e) { /* ignore corrupt data */ }
     }
 
@@ -497,31 +608,63 @@
         document.getElementById('filter-status').value = 'all';
         document.getElementById('filter-split').value = 'all';
         document.getElementById('filter-class').value = 'all';
+        if (document.getElementById('tag-positive')) document.getElementById('tag-positive').value = '';
+        if (document.getElementById('tag-negative')) document.getElementById('tag-negative').value = '';
+        activeTagResultNames = null;
         sessionStorage.removeItem(STORAGE_KEY);
         runFilters();
+    }
+
+    function restoreBenchmarkSettings() {
+        const batchInput = document.getElementById('benchmark-batch-size');
+        if (!batchInput) return;
+        try {
+            const raw = localStorage.getItem(BENCHMARK_SETTINGS_KEY);
+            const state = raw ? JSON.parse(raw) : {};
+            if (state.batchSize) batchInput.value = state.batchSize;
+        } catch (e) { /* ignore corrupt data */ }
+        batchInput.addEventListener('change', () => {
+            const batchSize = Math.max(1, Math.min(64, Number(batchInput.value || 8)));
+            batchInput.value = batchSize;
+            localStorage.setItem(BENCHMARK_SETTINGS_KEY, JSON.stringify({ batchSize }));
+        });
     }
 
     document.addEventListener("DOMContentLoaded", async () => {
         // Restore saved filter/sort state
         restoreFilterState();
+        restoreBenchmarkSettings();
         runFilters();
+        ['tag-positive', 'tag-negative'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) {
+                el.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') submitTagSearch();
+                });
+            }
+        });
 
         try {
             const resp = await fetch("/api/models");
             if (resp.ok) {
                 const data = await resp.json();
                 const sel = document.getElementById("auto-check-model");
+                const autoLabelA = document.getElementById("auto-label-model-a");
+                const autoLabelB = document.getElementById("auto-label-model-b");
                 data.models.forEach(m => {
                     const opt = document.createElement("option");
                     opt.value = m;
                     opt.textContent = m;
-                    sel.appendChild(opt);
+                    if (sel) sel.appendChild(opt);
+                    if (autoLabelA) autoLabelA.appendChild(opt.cloneNode(true));
+                    if (autoLabelB) autoLabelB.appendChild(opt.cloneNode(true));
                 });
                 populateBenchmarkModels(data.models);
             }
         } catch (e) { console.error("Could not load models", e); }
 
         loadSavedBenchmark();
+        resumeBenchmarkProgressIfRunning();
     });
 
     function populateBenchmarkModels(models) {
@@ -558,6 +701,222 @@
         } catch (e) { /* ignore */ }
     }
 
+    function setBenchmarkProgressVisible(visible) {
+        const wrap = document.getElementById('benchmark-progress');
+        if (wrap) wrap.classList.toggle('hidden', !visible);
+    }
+
+    function formatProgressEta(progress, startTime) {
+        const current = Number(progress.current || 0);
+        const total = Number(progress.total || 0);
+        if (progress.status !== 'running' || total <= 0 || current <= 0) return '';
+
+        const lastDuration = Number(progress.last_duration || 0);
+        if (lastDuration > 0) {
+            return `ETA ${formatEta(lastDuration * Math.max(0, total - current))}`;
+        }
+
+        const phaseStartedAt = Number(progress.phase_started_at || progress.started_at || 0) * 1000;
+        const elapsedBase = phaseStartedAt > 0 ? phaseStartedAt : startTime;
+        const elapsed = Math.max(0, (Date.now() - elapsedBase) / 1000);
+        const avg = elapsed / current;
+        return `ETA ${formatEta(avg * Math.max(0, total - current))}`;
+    }
+
+    function renderBenchmarkProgress(progress, startTime) {
+        const label = document.getElementById('benchmark-progress-label');
+        const count = document.getElementById('benchmark-progress-count');
+        const bar = document.getElementById('benchmark-progress-bar');
+        const message = document.getElementById('benchmark-progress-message');
+        const current = Number(progress.current || 0);
+        const total = Number(progress.total || 0);
+        const phase = progress.phase || '';
+        const phaseLabel = phase === 'combinations' ? 'Combinations' : (phase === 'done' ? 'Benchmark done' : 'Models');
+
+        setBenchmarkProgressVisible(progress.status === 'running' || progress.status === 'done' || progress.status === 'error');
+
+        if (label) label.textContent = progress.status === 'error' ? 'Benchmark error' : phaseLabel;
+        if (count) count.textContent = total > 0 ? `${current}/${total}` : 'preparing';
+        if (bar) {
+            const pct = total > 0 ? Math.max(0, Math.min(100, (current / total) * 100)) : (progress.status === 'running' ? 12 : 0);
+            bar.style.width = `${pct}%`;
+        }
+        if (message) {
+            const eta = formatProgressEta(progress, startTime);
+            const etaText = eta ? ` · ${eta}` : '';
+            message.textContent = `${progress.message || ''}${etaText}`;
+        }
+    }
+
+    function startProgressPolling(taskType, btnElement, origText, startTime) {
+        let isDone = false;
+        
+        const interval = setInterval(async () => {
+            if (isDone) {
+                clearInterval(interval);
+                return;
+            }
+            
+            try {
+                const resp = await fetch(`/api/dataset/${datasetName}/progress/${taskType}`);
+                if (!resp.ok) return;
+                const progress = await resp.json();
+                
+                if (progress.status === 'running' && progress.total > 0) {
+                    const current = Number(progress.current || 0);
+                    const total = Number(progress.total || 0);
+                    const phaseStartedAt = Number(progress.phase_started_at || 0) * 1000;
+                    const elapsedBase = phaseStartedAt > 0 ? phaseStartedAt : startTime;
+                    const elapsed = Math.max(0, (Date.now() - elapsedBase) / 1000);
+                    
+                    let etaText = "";
+                    if (current > 0) {
+                        const eta = formatProgressEta(progress, startTime).replace(/^ETA\s+/, '');
+                        etaText = eta ? ` (ETA: ${eta})` : "";
+                    }
+                    
+                    if (taskType === 'benchmark') {
+                        const phaseLabel = progress.phase === 'combinations' ? 'Combinations' : 'Models';
+                        btnElement.textContent = `${phaseLabel} ${current}/${total}${etaText}`;
+                        renderBenchmarkProgress(progress, startTime);
+                    } else if (taskType === 'auto_check') {
+                        btnElement.textContent = `Checking ${current}/${total}${etaText}`;
+                    } else if (taskType === 'auto_label') {
+                        btnElement.textContent = `Labeling ${current}/${total}${etaText}`;
+                    }
+                } else if (progress.status === 'done' || progress.status === 'error') {
+                    if (taskType === 'benchmark') {
+                        renderBenchmarkProgress(progress, startTime);
+                        btnElement.textContent = origText;
+                        const btn = document.getElementById('benchmark-run-btn');
+                        if (btn) btn.disabled = false;
+                        activeBenchmarkStopPolling = null;
+                        if (progress.status === 'done') {
+                            loadSavedBenchmark();
+                        }
+                    }
+                    isDone = true;
+                    clearInterval(interval);
+                }
+            } catch (e) {
+                // ignore
+            }
+        }, 1000);
+        
+        return () => {
+            isDone = true;
+            clearInterval(interval);
+        };
+    }
+
+    async function resumeBenchmarkProgressIfRunning() {
+        try {
+            const resp = await fetch(`/api/dataset/${datasetName}/progress/benchmark`);
+            if (!resp.ok) return;
+            const progress = await resp.json();
+            if (progress.status !== 'running') {
+                if (progress.status === 'done' || progress.status === 'error') {
+                    renderBenchmarkProgress(progress, Date.now());
+                }
+                return;
+            }
+
+            const btn = document.getElementById('benchmark-run-btn');
+            const btnText = document.getElementById('benchmark-run-btn-text');
+            const origText = 'Run Benchmark';
+            if (btn) btn.disabled = true;
+            renderBenchmarkProgress(progress, Date.now());
+            if (btnText) {
+                const phaseLabel = progress.phase === 'combinations' ? 'Combinations' : 'Models';
+                btnText.textContent = `${phaseLabel} ${progress.current || 0}/${progress.total || 0}`;
+                if (activeBenchmarkStopPolling) activeBenchmarkStopPolling();
+                activeBenchmarkStopPolling = startProgressPolling('benchmark', btnText, origText, Date.now());
+            }
+        } catch (e) {
+            // Best-effort resume only.
+        }
+    }
+
+    function formatEta(seconds) {
+        if (!Number.isFinite(seconds) || seconds < 0) return '';
+        const rounded = Math.round(seconds);
+        if (rounded >= 60) {
+            return `${Math.floor(rounded / 60)}m ${rounded % 60}s`;
+        }
+        return `${rounded}s`;
+    }
+
+    function setReloadProgressVisible(visible) {
+        const wrap = document.getElementById('reload-progress');
+        if (wrap) wrap.classList.toggle('hidden', !visible);
+    }
+
+    function renderReloadProgress(progress, startTime) {
+        const label = document.getElementById('reload-progress-label');
+        const count = document.getElementById('reload-progress-count');
+        const bar = document.getElementById('reload-progress-bar');
+        const message = document.getElementById('reload-progress-message');
+        const current = Number(progress.current || 0);
+        const total = Number(progress.total || 0);
+        const phase = progress.phase || '';
+
+        if (label) {
+            label.textContent = phase === 'tagging' ? 'Tagging images' : (phase === 'done' ? 'Reload done' : 'Reloading');
+        }
+
+        let pct = 0;
+        if (total > 0) {
+            pct = Math.max(0, Math.min(100, (current / total) * 100));
+        } else if (progress.status === 'running') {
+            pct = 12;
+        } else if (progress.status === 'done') {
+            pct = 100;
+        }
+        if (bar) bar.style.width = `${pct}%`;
+
+        if (count) {
+            count.textContent = total > 0 ? `${current}/${total}` : 'preparing';
+        }
+
+        if (message) {
+            let etaText = '';
+            if (total > 0 && current > 0 && progress.status === 'running') {
+                const elapsed = (Date.now() - startTime) / 1000;
+                const avg = elapsed / current;
+                etaText = ` · ETA ${formatEta(avg * (total - current))}`;
+            }
+            message.textContent = `${progress.message || ''}${etaText}`;
+        }
+    }
+
+    function startReloadProgressPolling(startTime) {
+        let stopped = false;
+        setReloadProgressVisible(true);
+        const interval = setInterval(async () => {
+            if (stopped) {
+                clearInterval(interval);
+                return;
+            }
+            try {
+                const resp = await fetch(`/api/dataset/${datasetName}/progress/reload`);
+                if (!resp.ok) return;
+                const progress = await resp.json();
+                renderReloadProgress(progress, startTime);
+                if (progress.status === 'done' || progress.status === 'error') {
+                    stopped = true;
+                    clearInterval(interval);
+                }
+            } catch (e) {
+                // Keep polling while the reload request is in flight.
+            }
+        }, 1000);
+
+        return () => {
+            stopped = true;
+            clearInterval(interval);
+        };
+    }
+
     async function submitBenchmark() {
         const selected = Array.from(document.querySelectorAll('.bench-model:checked')).map(c => c.value);
         if (selected.length === 0) {
@@ -565,21 +924,34 @@
             return;
         }
         const split = document.getElementById('benchmark-split').value;
+        const batchInput = document.getElementById('benchmark-batch-size');
+        const batchSize = Math.max(1, Math.min(64, Number(batchInput?.value || 8)));
+        if (batchInput) {
+            batchInput.value = batchSize;
+            localStorage.setItem(BENCHMARK_SETTINGS_KEY, JSON.stringify({ batchSize }));
+        }
         const btn = document.getElementById('benchmark-run-btn');
         const btnText = document.getElementById('benchmark-run-btn-text');
         const origText = btnText.textContent;
         btn.disabled = true;
         btnText.textContent = `Running ${selected.length} model${selected.length > 1 ? 's' : ''}...`;
 
+        if (activeBenchmarkStopPolling) activeBenchmarkStopPolling();
+        const stopPolling = startProgressPolling('benchmark', btnText, origText, Date.now());
+        activeBenchmarkStopPolling = stopPolling;
+
         try {
             const resp = await fetch(`/api/dataset/${datasetName}/benchmark`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ model_names: selected, split: split })
+                body: JSON.stringify({ model_names: selected, split: split, batch_size: batchSize })
             });
             if (!resp.ok) {
                 const err = await resp.json().catch(() => ({}));
                 alert(err.detail || 'Benchmark failed');
+                if (resp.status === 409) {
+                    resumeBenchmarkProgressIfRunning();
+                }
                 return;
             }
             const data = await resp.json();
@@ -588,6 +960,8 @@
             console.error(e);
             alert('Network error during benchmark.');
         } finally {
+            stopPolling();
+            if (activeBenchmarkStopPolling === stopPolling) activeBenchmarkStopPolling = null;
             btn.disabled = false;
             btnText.textContent = origText;
         }
@@ -602,21 +976,41 @@
 
         const splitLabel = data.split === 'all' ? 'all splits' : `${data.split} split`;
         const ranAt = data.ran_at ? ` · ${data.ran_at}` : '';
-        meta.textContent = `${data.image_count} img · ${splitLabel} · ${data.device || 'cpu'}${ranAt}`;
+        const batchLabel = data.batch_size ? ` · batch ${data.batch_size}` : '';
+        meta.textContent = `${data.image_count} img · ${splitLabel} · ${data.device || 'cpu'}${batchLabel}${ranAt}`;
 
         if (weightsEl) {
-            const w = data.weights;
+            const scoring = data.scoring || {};
             const crit = (data.critical_classes_used && data.critical_classes_used.length)
                 ? data.critical_classes_used.join(', ')
                 : '—';
-            if (w) {
-                weightsEl.textContent = `Weights: mask ${(w.mask * 100).toFixed(0)} / class ${(w.class * 100).toFixed(0)} / critical ${(w.critical * 100).toFixed(0)} · critical classes: ${crit}`;
+            const ignored = (data.ignored_classes_used && data.ignored_classes_used.length)
+                ? data.ignored_classes_used.join(', ')
+                : '—';
+            const comboFilter = data.combination_filter
+                ? ` · combinations: top ${data.combination_filter.rank_limit || 'all'}, score >= ${data.combination_filter.min_score.toFixed(0)}, penalty <= ${(data.combination_filter.max_penalty * 100).toFixed(0)}pt (${data.combination_filter.eligible_models.length} models, ${data.combination_filter.pair_count} pairs)`
+                : '';
+            if (scoring.mode === 'penalty_points') {
+                weightsEl.textContent = `Penalty scoring: critical miss max -${scoring.critical_miss_max_points.toFixed(0)}pt · GT-outside detection max -${scoring.false_positive_max_points.toFixed(0)}pt · critical classes: ${crit} · ignored classes: ${ignored}${comboFilter}`;
+            } else if (data.weights) {
+                const w = data.weights;
+                weightsEl.textContent = `Coverage-first weights: mask ${(w.mask * 100).toFixed(0)} / class ${(w.class * 100).toFixed(0)} / critical ${(w.critical * 100).toFixed(0)} · critical classes: ${crit} · ignored classes: ${ignored}${comboFilter}`;
             } else {
-                weightsEl.textContent = '';
+                weightsEl.textContent = `Critical classes: ${crit} · ignored classes: ${ignored}${comboFilter}`;
             }
         }
 
         const pct = (v) => (v === null || v === undefined) ? '—' : `${(v * 100).toFixed(1)}%`;
+        const penaltyBadge = (item) => {
+            const points = item.penalty_points !== undefined && item.penalty_points !== null
+                ? Number(item.penalty_points)
+                : Number(item.penalty || 0) * 100;
+            if (!Number.isFinite(points) || points <= 0) return '';
+            const critical = Number(item.critical_miss_penalty || 0);
+            const fp = Number(item.false_positive_penalty || 0);
+            const title = `Penalty: ${points.toFixed(1)}pt · critical miss ${critical.toFixed(1)}pt · GT-outside detection ${fp.toFixed(1)}pt`;
+            return ` <span class="text-[9px] text-rose-400 font-normal" title="${title}">(-${points.toFixed(points >= 10 ? 0 : 1)}pt)</span>`;
+        };
 
         data.results.forEach((r, i) => {
             const tr = document.createElement('tr');
@@ -624,19 +1018,62 @@
             const rankClass = r.error
                 ? 'text-rose-400'
                 : (i === 0 ? 'text-emerald-400 font-bold' : (i === 1 ? 'text-amber-300' : 'text-slate-300'));
-            const scoreCell = (r.score === null || r.score === undefined) ? '—' : r.score.toFixed(1);
+            
+            const scoreCell = (r.score === null || r.score === undefined) ? '—' : `${r.score.toFixed(1)}${penaltyBadge(r)}`;
+            const coverTitle = `Raw IoU: ${pct(r.raw_iou)} · GT coverage: ${pct(r.mask_coverage)} · GT-outside detection ratio: ${pct(r.overreach)} · undercoverage: ${pct(r.undercoverage)}`;
+            
             const errMark = r.error ? `<span title="${r.error.replace(/"/g, '&quot;')}" class="text-rose-400 ml-1">⚠</span>` : '';
             tr.innerHTML = `
                 <td class="py-1 ${rankClass}">${i + 1}</td>
                 <td class="py-1 truncate max-w-[8rem] ${rankClass}" title="${r.model}">${r.model}${errMark}</td>
                 <td class="py-1 text-right ${rankClass}">${scoreCell}</td>
-                <td class="py-1 text-right text-slate-400">${pct(r.mean_iou)}</td>
+                <td class="py-1 text-right text-slate-400" title="${coverTitle}">${pct(r.mean_iou)}</td>
                 <td class="py-1 text-right text-slate-400">${pct(r.class_recall)}</td>
                 <td class="py-1 text-right text-slate-400">${pct(r.critical_iou)}</td>
                 <td class="py-1 text-right text-slate-500">${r.elapsed_sec.toFixed(1)}s</td>
             `;
             tbody.appendChild(tr);
         });
+
+        // Render combinations (2-model ensemble results)
+        const comboSection = document.getElementById('benchmark-combos-section');
+        const comboTbody = document.getElementById('benchmark-combos-tbody');
+        const comboMeta = document.getElementById('benchmark-combos-meta');
+        if (comboSection && comboTbody) {
+            comboTbody.innerHTML = '';
+            if (data.combinations && data.combinations.length > 0) {
+                comboSection.classList.remove('hidden');
+                const topCombinations = data.combinations.slice(0, 10);
+                if (comboMeta) {
+                    comboMeta.textContent = `Top ${topCombinations.length} of ${data.combinations.length}`;
+                }
+                topCombinations.forEach((c, idx) => {
+                    const tr = document.createElement('tr');
+                    tr.className = 'border-b border-slate-800/50';
+                    const rankClass = idx === 0 ? 'text-cyan-400 font-bold' : 'text-slate-300';
+                    
+                    const scoreCell = (c.score === null || c.score === undefined) ? '—' : `${c.score.toFixed(1)}${penaltyBadge(c)}`;
+                    const coverTitle = `Raw IoU: ${pct(c.raw_iou)} · GT coverage: ${pct(c.mask_coverage)} · GT-outside detection ratio: ${pct(c.overreach)} · undercoverage: ${pct(c.undercoverage)}`;
+                    
+                    tr.innerHTML = `
+                        <td class="py-1 truncate max-w-[10rem] ${rankClass}" title="${c.model_a} + ${c.model_b}">
+                            <div class="flex flex-col">
+                                <span class="truncate">${c.model_a}</span>
+                                <span class="text-[10px] text-slate-500 truncate">+ ${c.model_b}</span>
+                            </div>
+                        </td>
+                        <td class="py-1 text-right align-middle ${rankClass}">${scoreCell}</td>
+                        <td class="py-1 text-right align-middle text-slate-400" title="${coverTitle}">${pct(c.mean_iou)}</td>
+                        <td class="py-1 text-right align-middle text-slate-400">${pct(c.class_recall)}</td>
+                        <td class="py-1 text-right align-middle text-slate-400">${pct(c.critical_iou)}</td>
+                    `;
+                    comboTbody.appendChild(tr);
+                });
+            } else {
+                comboSection.classList.add('hidden');
+                if (comboMeta) comboMeta.textContent = '';
+            }
+        }
 
         wrap.classList.remove('hidden');
     }
@@ -653,6 +1090,43 @@
     }
 
     // Filter Logic
+    async function submitTagSearch() {
+        const pos = document.getElementById('tag-positive')?.value || '';
+        const neg = document.getElementById('tag-negative')?.value || '';
+        if (!pos.trim()) {
+            activeTagResultNames = null;
+            saveFilterState();
+            runFilters();
+            return;
+        }
+
+        const split = document.getElementById('filter-split')?.value || 'all';
+        try {
+            const resp = await fetch(`/api/dataset/${datasetName}/tag_search`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    positive_tags: pos.split(',').map(s => s.trim()).filter(Boolean),
+                    negative_tags: neg.split(',').map(s => s.trim()).filter(Boolean),
+                    split,
+                    limit: 2000
+                })
+            });
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                alert(err.detail || 'Tag search failed');
+                return;
+            }
+            const data = await resp.json();
+            activeTagResultNames = new Set((data.results || []).map(r => r.filename));
+            saveFilterState();
+            runFilters();
+        } catch (e) {
+            console.error(e);
+            alert('Network error during tag search.');
+        }
+    }
+
     function runFilters() {
         const valStatus = document.getElementById('filter-status').value;
         const valSplit = document.getElementById('filter-split').value;
@@ -676,6 +1150,7 @@
             polymax: 'polymax',
             polymin: 'polymin',
             edge: 'edge',
+            overlap: 'overlap',
         };
         itemsArray.sort((a, b) => {
             if (sortOrder === 'name') {
@@ -699,15 +1174,16 @@
             const split = item.dataset.split;
             const labeled = item.dataset.labeled;
             const negative = item.dataset.negative;
+            const unreviewed = item.dataset.unreviewed;
             const classes = item.dataset.classes ? item.dataset.classes.split(',') : [];
             const isDuplicate = item.dataset.duplicate;
 
             let show = true;
 
             if (valStatus !== 'all') {
-                if (valStatus === 'labeled' && labeled === 'false') show = false;
+                if (valStatus === 'labeled' && (labeled === 'false' || unreviewed === 'true')) show = false;
                 // Truly "needs work": unlabeled AND not flagged as a negative sample.
-                if (valStatus === 'unlabeled' && (labeled === 'true' || negative === 'true')) show = false;
+                if (valStatus === 'unlabeled' && ((labeled === 'true' && unreviewed !== 'true') || negative === 'true')) show = false;
                 if (valStatus === 'negative' && negative !== 'true') show = false;
                 if (valStatus === 'duplicate' && isDuplicate === 'false') show = false;
             }
@@ -722,6 +1198,10 @@
             }
 
             if (valClass !== 'all' && !classes.includes(valClass)) {
+                show = false;
+            }
+
+            if (activeTagResultNames && !activeTagResultNames.has(item.dataset.name)) {
                 show = false;
             }
 
@@ -861,9 +1341,11 @@
             return;
         }
         const btn = document.querySelector('button[onclick="submitAutoCheck()"]');
-        const origText = btn.innerHTML;
-        btn.innerHTML = 'Checking...';
+        const origText = btn.textContent;
+        btn.textContent = 'Checking...';
         btn.disabled = true;
+
+        const stopPolling = startProgressPolling('auto_check', btn, origText, Date.now());
 
         try {
             const resp = await fetch(`/api/dataset/${datasetName}/auto_check`, {
@@ -879,9 +1361,56 @@
             }
         } catch (e) {
             alert("Network error.");
+        } finally {
+            stopPolling();
+            btn.textContent = origText;
+            btn.disabled = false;
         }
-        btn.innerHTML = origText;
-        btn.disabled = false;
+    }
+
+    async function submitAutoLabelPending() {
+        const modelA = document.getElementById('auto-label-model-a')?.value || '';
+        const modelB = document.getElementById('auto-label-model-b')?.value || '';
+        if (!modelA || !modelB) {
+            alert("Select two models first.");
+            return;
+        }
+        if (modelA === modelB) {
+            alert("Select two different models.");
+            return;
+        }
+        if (!confirm("Auto label Pending images with the selected two models?\n\nExisting reviewed Pending labels will not be overwritten. Auto-labeled images will be marked as unreviewed.")) {
+            return;
+        }
+
+        const btn = document.getElementById('auto-label-pending-btn');
+        const origText = btn.textContent;
+        btn.textContent = 'Starting...';
+        btn.disabled = true;
+        const stopPolling = startProgressPolling('auto_label', btn, origText, Date.now());
+
+        try {
+            const resp = await fetch(`/api/dataset/${datasetName}/auto_label_pending`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model_a: modelA, model_b: modelB })
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+                alert(data.detail || "Error during auto labeling.");
+                return;
+            }
+            if (data.error_count) {
+                alert(`Auto labeling finished with ${data.error_count} error(s).\nProcessed ${data.processed}/${data.target_count}.`);
+            }
+            window.location.reload();
+        } catch (e) {
+            alert("Network error.");
+        } finally {
+            stopPolling();
+            btn.textContent = origText;
+            btn.disabled = false;
+        }
     }
 
     function showArchiveUploadResult(data) {
@@ -891,10 +1420,14 @@
         box.innerHTML = '';
         box.classList.remove('hidden');
 
-        const mb = (data.bytes_uploaded / (1024 * 1024)).toFixed(2);
+        let mbStr = '';
+        if (data.bytes_uploaded) {
+            mbStr = ` (${(data.bytes_uploaded / (1024 * 1024)).toFixed(2)} MB)`;
+        }
+
         const title = document.createElement('div');
         title.className = 'font-semibold text-violet-100 mb-1';
-        title.textContent = `Uploaded ${data.archive_filename || 'archive'} (${mb} MB)`;
+        title.textContent = `Uploaded ${data.archive_filename || 'archive'}${mbStr}`;
         box.appendChild(title);
 
         if (data.download_url) {
@@ -913,6 +1446,63 @@
         }
     }
 
+    let uploadPollInterval = null;
+
+    async function checkUploadStatus() {
+        const btn = document.getElementById('archive-upload-btn');
+        const resultBox = document.getElementById('archive-upload-result');
+        if (!btn) return;
+        
+        try {
+            const resp = await fetch(`/api/dataset/${datasetName}/upload_status`);
+            if (!resp.ok) return;
+            const data = await resp.json();
+            
+            if (data.status === 'compressing' || data.status === 'uploading') {
+                btn.disabled = true;
+                if (data.status === 'compressing') {
+                    btn.innerHTML = 'Compressing...';
+                } else {
+                    btn.innerHTML = 'Uploading...';
+                }
+                
+                if (!uploadPollInterval) {
+                    uploadPollInterval = setInterval(checkUploadStatus, 2000);
+                }
+            } else if (data.status === 'complete') {
+                btn.disabled = false;
+                btn.innerHTML = 'Archive & Upload';
+                
+                if (uploadPollInterval) {
+                    clearInterval(uploadPollInterval);
+                    uploadPollInterval = null;
+                }
+                showArchiveUploadResult(data);
+            } else if (data.status === 'error') {
+                btn.disabled = false;
+                btn.innerHTML = 'Archive & Upload';
+                if (uploadPollInterval) {
+                    clearInterval(uploadPollInterval);
+                    uploadPollInterval = null;
+                }
+                
+                if (resultBox) {
+                    resultBox.innerHTML = `<div class="text-rose-400 font-semibold mb-1">Failed: ${data.error_msg || 'unknown error'}</div>`;
+                    resultBox.classList.remove('hidden');
+                }
+            } else {
+                btn.disabled = false;
+                btn.innerHTML = 'Archive & Upload';
+                if (uploadPollInterval) {
+                    clearInterval(uploadPollInterval);
+                    uploadPollInterval = null;
+                }
+            }
+        } catch (e) {
+            console.error("Error checking upload status:", e);
+        }
+    }
+
     async function submitArchiveUpload() {
         if (!confirm(`Archive "${datasetName}" as 7z and upload it as a public download?`)) {
             return;
@@ -920,27 +1510,28 @@
         const btn = document.getElementById('archive-upload-btn');
         const resultBox = document.getElementById('archive-upload-result');
         if (!btn) return;
-        const origHTML = btn.innerHTML;
+        
         btn.disabled = true;
-        btn.innerHTML = 'Compressing & uploading...';
+        btn.innerHTML = 'Starting...';
         if (resultBox) {
             resultBox.classList.add('hidden');
             resultBox.innerHTML = '';
         }
+        
         try {
             const resp = await fetch(`/api/dataset/${datasetName}/archive_upload`, { method: 'POST' });
             if (!resp.ok) {
                 const err = await resp.json().catch(() => ({}));
                 alert(err.detail || 'Upload failed');
+                btn.disabled = false;
+                btn.innerHTML = 'Archive & Upload';
                 return;
             }
-            const data = await resp.json();
-            showArchiveUploadResult(data);
+            checkUploadStatus();
         } catch (e) {
             alert('Network error');
-        } finally {
             btn.disabled = false;
-            btn.innerHTML = origHTML;
+            btn.innerHTML = 'Archive & Upload';
         }
     }
 
@@ -996,16 +1587,80 @@
         }
     }
 
+    async function submitMovePendingLabeledToTest() {
+        if (!confirm("Move completed Pending images into the Test split?\n\nPending images with segmentation labels, plus images marked as Negative, will be moved. Empty or unfinished labels will stay in Pending.")) {
+            return;
+        }
+        const btn = document.getElementById('move-pending-labeled-btn');
+        const orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = 'Moving...';
+        try {
+            const resp = await fetch(`/api/dataset/${datasetName}/move_pending_labeled_to_test`, { method: 'POST' });
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                alert(err.detail || 'Error moving pending labeled images');
+                return;
+            }
+            const data = await resp.json();
+            const duplicateText = data.duplicates ? `\nSkipped duplicate already in Test: ${data.duplicates}` : '';
+            const unreviewedText = data.skipped_unreviewed ? `\nSkipped unreviewed auto-labeled: ${data.skipped_unreviewed}` : '';
+            alert(`Moved ${data.moved} completed pending image(s) to Test.${duplicateText}${unreviewedText}`);
+            window.location.reload();
+        } catch (e) {
+            alert('Network error');
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = orig;
+        }
+    }
+
     async function normalizeAndReload(btn) {
         const textEl = document.getElementById('reload-btn-text');
+        const startTime = Date.now();
         if (btn) btn.disabled = true;
         if (textEl) textEl.textContent = 'Normalizing...';
+        setReloadProgressVisible(true);
+        renderReloadProgress({
+            status: 'running',
+            current: 0,
+            total: 0,
+            phase: 'normalize',
+            message: 'Normalizing filenames...'
+        }, startTime);
+        const stopPolling = startReloadProgressPolling(startTime);
         try {
-            await fetch(`/api/dataset/${datasetName}/normalize_filenames`, { method: 'POST' });
+            const resp = await fetch(`/api/dataset/${datasetName}/normalize_filenames`, { method: 'POST' });
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                throw new Error(err.detail || 'Reload failed');
+            }
+            const data = await resp.json();
+            const tagged = data.tagging ? Number(data.tagging.tagged || 0) : 0;
+            const total = data.tagging ? Number(data.tagging.missing_before || 0) : 0;
+            renderReloadProgress({
+                status: 'done',
+                current: total,
+                total,
+                phase: 'done',
+                message: `Done. Tagged ${tagged}/${total} image(s).`
+            }, startTime);
+            setTimeout(() => window.location.reload(), 500);
         } catch (e) {
             console.error('normalize failed', e);
+            alert(e.message || 'Reload failed');
+            if (btn) btn.disabled = false;
+            if (textEl) textEl.textContent = 'Reload';
+            renderReloadProgress({
+                status: 'error',
+                current: 0,
+                total: 0,
+                phase: 'error',
+                message: e.message || 'Reload failed'
+            }, startTime);
+        } finally {
+            stopPolling();
         }
-        window.location.reload();
     }
 
     async function moveImage(imagePath, targetSplit, selectElement) {
@@ -1040,5 +1695,8 @@
             alert("Network error");
         }
     }
+    
+    // Check initial upload status on page load (in case page was reloaded during upload)
+    checkUploadStatus();
 </script>
 {% endblock %}

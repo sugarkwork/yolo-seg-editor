@@ -1,5 +1,14 @@
 /datasets
+/models
+/models_*/
+/tagger_models
+*.pt
+*.onnx
+*.log
+*.key
 /hello.py
 /old
 /venv
+/venv_linux
+__pycache__/
 dataset_app/__pycache__/

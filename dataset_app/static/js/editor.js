@@ -3,6 +3,11 @@ document.addEventListener("DOMContentLoaded", () => {
     const ctx = canvas.getContext('2d');
     const container = document.getElementById('editor-container');
     const sourceImage = document.getElementById('source-image');
+    const polygonListContainer = document.getElementById('polygon-list-container');
+    const polygonListCount = document.getElementById('polygon-list-count');
+    const newLabelBtn = document.getElementById('new-label-btn');
+    const splitToolBtn = document.getElementById('split-tool-btn');
+    const splitBrushSizeInput = document.getElementById('split-brush-size');
 
     // Render the canvas backing buffer at this multiple of the image's natural
     // size so CSS-zoom can stretch up to `RESOLUTION_MULTIPLIER`x before pixels
@@ -11,9 +16,11 @@ document.addEventListener("DOMContentLoaded", () => {
     const RESOLUTION_MULTIPLIER = 2;
 
     // State
-    let polygons = []; // Array of { classId, points: [{x, y}] }
+    let polygons = []; // Array of { labelId, classId, points: [{x, y}] }
     let currentPolygon = null;
     let activeClassId = 0;
+    let activeLabelId = null;
+    let labelIdCounter = 1;
 
     // Viewport State
     let scale = 1;
@@ -28,30 +35,49 @@ document.addEventListener("DOMContentLoaded", () => {
     let hoveredPolygonIndex = -1;
     let hoveredVertexIndex = -1;
     let isDraggingVertex = false;
+    let polygonListSignature = '';
+    let splitBrushMode = false;
+    let isSplitPainting = false;
+    let splitStroke = [];
 
     // UI Setup
     const classSelectors = document.querySelectorAll('.class-selector');
-    classSelectors.forEach(btn => {
-        btn.addEventListener('click', () => {
-            // Update UI
-            classSelectors.forEach(b => {
-                b.classList.remove('bg-indigo-500/20', 'border-indigo-500/50', 'text-indigo-300');
-                b.classList.add('bg-slate-800/50', 'text-slate-300', 'border-transparent');
-            });
+
+    function updateActiveClassButton(classId) {
+        document.querySelectorAll('.class-selector').forEach(b => {
+            b.classList.remove('bg-indigo-500/20', 'border-indigo-500/50', 'text-indigo-300');
+            b.classList.add('bg-slate-800/50', 'text-slate-300', 'border-transparent');
+        });
+        const btn = document.querySelector(`.class-selector[data-class-id="${classId}"]`);
+        if (btn) {
             btn.classList.add('bg-indigo-500/20', 'border-indigo-500/50', 'text-indigo-300');
             btn.classList.remove('bg-slate-800/50', 'text-slate-300', 'border-transparent');
+        }
+    }
 
-            // Set active class
-            activeClassId = parseInt(btn.dataset.classId);
-
-            // Change selected polygon's class if one is selected
-            if (selectedPolygonIndex >= 0) {
-                if (polygons[selectedPolygonIndex].classId !== activeClassId) {
-                    polygons[selectedPolygonIndex].classId = activeClassId;
-                    draw();
-                    saveHistory();
+    function setActiveClass(classId, updateActiveLabel = true) {
+        activeClassId = classId;
+        updateActiveClassButton(classId);
+        if (updateActiveLabel && activeLabelId) {
+            let changed = false;
+            polygons.forEach(poly => {
+                if (poly.labelId === activeLabelId && poly.classId !== classId) {
+                    poly.classId = classId;
+                    changed = true;
                 }
+            });
+            if (changed) {
+                draw();
+                saveHistory();
+            } else {
+                draw();
             }
+        }
+    }
+
+    classSelectors.forEach(btn => {
+        btn.addEventListener('click', () => {
+            setActiveClass(parseInt(btn.dataset.classId, 10), true);
         });
     });
 
@@ -108,6 +134,18 @@ document.addEventListener("DOMContentLoaded", () => {
     const dnHCol = document.getElementById('dn-h-col');
     const dnTw = document.getElementById('dn-tw');
     const dnSw = document.getElementById('dn-sw');
+    const usePaddingInferenceChk = document.getElementById('use-padding-inference-chk');
+    const paddingInferenceParams = document.getElementById('padding-inference-params');
+    const padYPercentInput = document.getElementById('pad-y-percent');
+    const padXPercentInput = document.getElementById('pad-x-percent');
+    const paddingLargeThresholdInput = document.getElementById('padding-large-threshold');
+    const paddingMatchIouInput = document.getElementById('padding-match-iou');
+    const paddingMergeModeSelect = document.getElementById('padding-merge-mode');
+
+    function readNumberInput(input, fallback) {
+        const value = parseFloat(input?.value);
+        return Number.isFinite(value) ? value : fallback;
+    }
 
     function loadDenoiseSettings() {
         if (!useDenoiseChk) return;
@@ -148,7 +186,49 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     }
 
+    function loadPaddingInferenceSettings() {
+        if (!usePaddingInferenceChk) return;
+        const saved = localStorage.getItem('dataset_editor_padding_inference_settings');
+        if (saved) {
+            try {
+                const s = JSON.parse(saved);
+                usePaddingInferenceChk.checked = s.usePaddingInference || false;
+                if (s.padYPercent !== undefined) padYPercentInput.value = s.padYPercent;
+                if (s.padXPercent !== undefined) padXPercentInput.value = s.padXPercent;
+                if (s.largeThreshold !== undefined) paddingLargeThresholdInput.value = s.largeThreshold;
+                if (s.matchIou !== undefined) paddingMatchIouInput.value = s.matchIou;
+                if (s.mergeMode) paddingMergeModeSelect.value = s.mergeMode;
+            } catch (e) {}
+        }
+        paddingInferenceParams.classList.toggle('hidden', !usePaddingInferenceChk.checked);
+    }
+
+    function savePaddingInferenceSettings() {
+        if (!usePaddingInferenceChk) return;
+        const s = {
+            usePaddingInference: usePaddingInferenceChk.checked,
+            padYPercent: readNumberInput(padYPercentInput, 30),
+            padXPercent: readNumberInput(padXPercentInput, 0),
+            largeThreshold: readNumberInput(paddingLargeThresholdInput, 60),
+            matchIou: readNumberInput(paddingMatchIouInput, 0.2),
+            mergeMode: paddingMergeModeSelect.value
+        };
+        localStorage.setItem('dataset_editor_padding_inference_settings', JSON.stringify(s));
+    }
+
+    if (usePaddingInferenceChk) {
+        loadPaddingInferenceSettings();
+        usePaddingInferenceChk.addEventListener('change', () => {
+            paddingInferenceParams.classList.toggle('hidden', !usePaddingInferenceChk.checked);
+            savePaddingInferenceSettings();
+        });
+        [padYPercentInput, padXPercentInput, paddingLargeThresholdInput, paddingMatchIouInput, paddingMergeModeSelect].forEach(el => {
+            if (el) el.addEventListener('change', savePaddingInferenceSettings);
+        });
+    }
+
     const shrinkBtn = document.getElementById('shrink-btn');
+    const expandBtn = document.getElementById('expand-btn');
     const shrinkPercentInput = document.getElementById('shrink-percent');
     const shrinkError = document.getElementById('shrink-error');
 
@@ -160,69 +240,83 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     }
 
-    if (shrinkBtn) {
-        shrinkBtn.addEventListener('click', async () => {
-            shrinkError.classList.add('hidden');
-            const pct = parseFloat(shrinkPercentInput.value);
-            if (!(pct > 0)) {
-                shrinkError.textContent = 'Enter a positive percent.';
+    const runShrinkExpand = async (isExpand) => {
+        if (!shrinkPercentInput || !shrinkError) return;
+        shrinkError.classList.add('hidden');
+        
+        let pct = parseFloat(shrinkPercentInput.value);
+        if (isNaN(pct) || pct <= 0) {
+            shrinkError.textContent = 'Enter a positive percent.';
+            shrinkError.classList.remove('hidden');
+            return;
+        }
+
+        if (polygons.length === 0) {
+            shrinkError.textContent = isExpand ? 'No polygons to expand.' : 'No polygons to shrink.';
+            shrinkError.classList.remove('hidden');
+            return;
+        }
+
+        // Negate percent if expanding
+        const sendPct = isExpand ? -pct : pct;
+        const indices = selectedPolygonIndex >= 0 ? [selectedPolygonIndex] : null;
+
+        if (shrinkBtn) shrinkBtn.disabled = true;
+        if (expandBtn) expandBtn.disabled = true;
+
+        try {
+            const payload = {
+                polygons: polygons.map(p => ({
+                    labelId: p.labelId,
+                    classId: p.classId,
+                    points: p.points.map(pt => ({ x: pt.x, y: pt.y }))
+                })),
+                shrink_percent: sendPct,
+                indices: indices
+            };
+            const resp = await fetch('/api/shrink_polygons', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            if (!resp.ok) {
+                const errDetail = await resp.json().catch(() => ({}));
+                shrinkError.textContent = 'Error: ' + (errDetail.detail || resp.statusText);
                 shrinkError.classList.remove('hidden');
                 return;
             }
-            if (polygons.length === 0) {
-                shrinkError.textContent = 'No polygons to shrink.';
-                shrinkError.classList.remove('hidden');
-                return;
-            }
-
-            const indices = selectedPolygonIndex >= 0 ? [selectedPolygonIndex] : null;
-
-            shrinkBtn.disabled = true;
-            try {
-                const payload = {
-                    polygons: polygons.map(p => ({
-                        classId: p.classId,
-                        points: p.points.map(pt => ({ x: pt.x, y: pt.y }))
-                    })),
-                    shrink_percent: pct,
-                    indices: indices
-                };
-                const resp = await fetch('/api/shrink_polygons', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-                if (!resp.ok) {
-                    const errDetail = await resp.json().catch(() => ({}));
-                    shrinkError.textContent = 'Error: ' + (errDetail.detail || resp.statusText);
-                    shrinkError.classList.remove('hidden');
-                    return;
-                }
-                const data = await resp.json();
-                const newPolys = [];
-                let selectedSurvived = false;
-                let newSelectedIndex = -1;
-                data.polygons.forEach((p, i) => {
-                    if (p.points && p.points.length >= 3) {
-                        if (i === selectedPolygonIndex) {
-                            selectedSurvived = true;
-                            newSelectedIndex = newPolys.length;
-                        }
-                        newPolys.push({ classId: p.classId, points: p.points });
+            const data = await resp.json();
+            const newPolys = [];
+            let selectedSurvived = false;
+            let newSelectedIndex = -1;
+            data.polygons.forEach((p, i) => {
+                if (p.points && p.points.length >= 3) {
+                    if (i === selectedPolygonIndex) {
+                        selectedSurvived = true;
+                        newSelectedIndex = newPolys.length;
                     }
-                });
-                polygons = newPolys;
-                selectedPolygonIndex = selectedSurvived ? newSelectedIndex : -1;
-                saveHistory();
-                draw();
-            } catch (e) {
-                console.error(e);
-                shrinkError.textContent = 'Network error.';
-                shrinkError.classList.remove('hidden');
-            } finally {
-                shrinkBtn.disabled = false;
-            }
-        });
+                    newPolys.push({ labelId: p.labelId || polygons[i]?.labelId || createLabelId(), classId: p.classId, points: p.points });
+                }
+            });
+            polygons = newPolys;
+            selectedPolygonIndex = selectedSurvived ? newSelectedIndex : -1;
+            saveHistory();
+            draw();
+        } catch (e) {
+            console.error(e);
+            shrinkError.textContent = 'Network error.';
+            shrinkError.classList.remove('hidden');
+        } finally {
+            if (shrinkBtn) shrinkBtn.disabled = false;
+            if (expandBtn) expandBtn.disabled = false;
+        }
+    };
+
+    if (shrinkBtn) {
+        shrinkBtn.addEventListener('click', () => runShrinkExpand(false));
+    }
+    if (expandBtn) {
+        expandBtn.addEventListener('click', () => runShrinkExpand(true));
     }
 
     const snapBtn = document.getElementById('snap-btn');
@@ -260,6 +354,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 const payload = {
                     image_path: window.IMAGE_URL,
                     polygons: polygons.map(p => ({
+                        labelId: p.labelId,
                         classId: p.classId,
                         points: p.points.map(pt => ({ x: pt.x, y: pt.y }))
                     })),
@@ -285,7 +380,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 data.polygons.forEach((p, i) => {
                     if (p.points && p.points.length >= 3) {
                         if (i === selectedPolygonIndex) newSelectedIndex = newPolys.length;
-                        newPolys.push({ classId: p.classId, points: p.points });
+                        newPolys.push({ labelId: p.labelId || polygons[i]?.labelId || createLabelId(), classId: p.classId, points: p.points });
                     }
                 });
                 polygons = newPolys;
@@ -329,6 +424,15 @@ document.addEventListener("DOMContentLoaded", () => {
                     payload.sw = parseInt(dnSw.value, 10);
                 }
 
+                if (usePaddingInferenceChk && usePaddingInferenceChk.checked) {
+                    payload.use_padding_inference = true;
+                    payload.pad_y_percent = readNumberInput(padYPercentInput, 30);
+                    payload.pad_x_percent = readNumberInput(padXPercentInput, 0);
+                    payload.large_threshold = readNumberInput(paddingLargeThresholdInput, 60);
+                    payload.padding_match_iou = readNumberInput(paddingMatchIouInput, 0.2);
+                    payload.padding_merge_mode = paddingMergeModeSelect.value || 'large_only';
+                }
+
                 const resp = await fetch('/api/auto_segment', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -343,10 +447,11 @@ document.addEventListener("DOMContentLoaded", () => {
 
                         data.polygons.forEach(p => {
                             const absolutePoly = {
+                                labelId: p.labelId || createLabelId(),
                                 classId: p.classId,
                                 points: p.points.map(pt => ({ x: pt.x * imgW, y: pt.y * imgH }))
                             };
-                            polygons.push(absolutePoly);
+                            polygons.push(...expandZeroWidthBridgedPolygon(absolutePoly));
                         });
                         saveHistory();
                         draw();
@@ -452,6 +557,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 if (polygons.length > 0) {
                     const yoloPolygons = polygons.map(poly => {
                         return {
+                            labelId: poly.labelId,
                             classId: poly.classId,
                             points: poly.points.map(pt => ({
                                 x: pt.x / sourceImage.naturalWidth,
@@ -515,6 +621,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
                 if (resp.ok) {
                     const data = await resp.json();
+                    window.CLASSES = data.classes;
                     const newIndex = data.classes.length - 1;
 
                     const btn = document.createElement('button');
@@ -522,22 +629,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     btn.dataset.classId = newIndex;
                     btn.innerHTML = `<div class="w-3 h-3 rounded-sm class-color-indicator" style="background-color: ${getClassColor(newIndex)}"></div><span class="text-sm truncate font-medium">${className}</span>`;
 
-                    btn.addEventListener('click', () => {
-                        document.querySelectorAll('.class-selector').forEach(b => {
-                            b.classList.remove('bg-indigo-500/20', 'border-indigo-500/50', 'text-indigo-300');
-                            b.classList.add('bg-slate-800/50', 'text-slate-300', 'border-transparent');
-                        });
-                        btn.classList.add('bg-indigo-500/20', 'border-indigo-500/50', 'text-indigo-300');
-                        btn.classList.remove('bg-slate-800/50', 'text-slate-300', 'border-transparent');
-                        activeClassId = newIndex;
-                        if (selectedPolygonIndex >= 0) {
-                            if (polygons[selectedPolygonIndex].classId !== activeClassId) {
-                                polygons[selectedPolygonIndex].classId = activeClassId;
-                                draw();
-                                saveHistory();
-                            }
-                        }
-                    });
+                    btn.addEventListener('click', () => setActiveClass(newIndex, true));
 
                     document.getElementById('class-list-container').appendChild(btn);
                     newClassInput.value = '';
@@ -555,6 +647,7 @@ document.addEventListener("DOMContentLoaded", () => {
     let historyIndex = -1;
 
     function saveHistory() {
+        ensurePolygonLabelIds();
         if (historyIndex < history.length - 1) {
             history = history.slice(0, historyIndex + 1);
         }
@@ -569,7 +662,9 @@ document.addEventListener("DOMContentLoaded", () => {
         if (historyIndex > 0) {
             historyIndex--;
             polygons = JSON.parse(history[historyIndex]);
+            ensurePolygonLabelIds();
             selectedPolygonIndex = -1;
+            activeLabelId = null;
             draw();
         }
     }
@@ -578,7 +673,9 @@ document.addEventListener("DOMContentLoaded", () => {
         if (historyIndex < history.length - 1) {
             historyIndex++;
             polygons = JSON.parse(history[historyIndex]);
+            ensurePolygonLabelIds();
             selectedPolygonIndex = -1;
+            activeLabelId = null;
             draw();
         }
     }
@@ -586,6 +683,357 @@ document.addEventListener("DOMContentLoaded", () => {
     // Helper: color generator based on ID
     function getClassColor(classId, alpha = 1) {
         return `hsla(${(classId * 137.5) % 360}, 70%, 60%, ${alpha})`;
+    }
+
+    function classNameForId(classId) {
+        return (window.CLASSES && window.CLASSES[classId]) ? window.CLASSES[classId] : `Class ${classId}`;
+    }
+
+    function createLabelId() {
+        return `label-${Date.now().toString(36)}-${labelIdCounter++}`;
+    }
+
+    function ensurePolygonLabelIds() {
+        polygons.forEach(poly => {
+            if (!poly.labelId) {
+                poly.labelId = createLabelId();
+            }
+        });
+    }
+
+    function labelGroups(includeActiveEmpty = false) {
+        const groups = new Map();
+        polygons.forEach((poly, idx) => {
+            if (!poly.labelId) poly.labelId = createLabelId();
+            if (!groups.has(poly.labelId)) {
+                groups.set(poly.labelId, { labelId: poly.labelId, classId: poly.classId, items: [] });
+            }
+            const group = groups.get(poly.labelId);
+            group.classId = poly.classId;
+            group.items.push({ poly, idx });
+        });
+        if (includeActiveEmpty && activeLabelId && !groups.has(activeLabelId)) {
+            groups.set(activeLabelId, { labelId: activeLabelId, classId: activeClassId, items: [] });
+        }
+        return Array.from(groups.values()).sort((a, b) => {
+            const ai = a.items.length ? a.items[0].idx : Number.MAX_SAFE_INTEGER;
+            const bi = b.items.length ? b.items[0].idx : Number.MAX_SAFE_INTEGER;
+            return ai - bi;
+        });
+    }
+
+    function labelDisplayName(labelId) {
+        const groups = labelGroups(true);
+        const idx = groups.findIndex(group => group.labelId === labelId);
+        return `Label ${idx >= 0 ? idx + 1 : ''}`.trim();
+    }
+
+    function pointKey(pt, precision = 3) {
+        return `${pt.x.toFixed(precision)},${pt.y.toFixed(precision)}`;
+    }
+
+    function polygonArea(points) {
+        if (points.length < 3) return 0;
+        let area = 0;
+        for (let i = 0; i < points.length; i++) {
+            const p = points[i];
+            const q = points[(i + 1) % points.length];
+            area += p.x * q.y - q.x * p.y;
+        }
+        return Math.abs(area) / 2;
+    }
+
+    function validPolygonPiece(points) {
+        return new Set(points.map(p => pointKey(p))).size >= 3 && polygonArea(points) > 0.5;
+    }
+
+    function splitZeroWidthBridgedPoints(points) {
+        const cleaned = [];
+        let lastKey = null;
+        points.forEach(pt => {
+            const key = pointKey(pt);
+            if (key === lastKey) return;
+            cleaned.push({ x: pt.x, y: pt.y });
+            lastKey = key;
+        });
+        if (cleaned.length >= 2 && pointKey(cleaned[0]) === pointKey(cleaned[cleaned.length - 1])) {
+            cleaned.pop();
+        }
+
+        const stack = [];
+        let indexByKey = new Map();
+        const pieces = [];
+        cleaned.forEach(pt => {
+            const key = pointKey(pt);
+            if (indexByKey.has(key)) {
+                const start = indexByKey.get(key);
+                const cycle = stack.slice(start);
+                if (validPolygonPiece(cycle)) pieces.push(cycle);
+                stack.splice(start + 1);
+                indexByKey = new Map(stack.map((p, i) => [pointKey(p), i]));
+                return;
+            }
+            indexByKey.set(key, stack.length);
+            stack.push(pt);
+        });
+
+        if (pieces.length > 0) return pieces;
+        return validPolygonPiece(cleaned) ? [cleaned] : [];
+    }
+
+    function expandZeroWidthBridgedPolygon(poly) {
+        const pieces = splitZeroWidthBridgedPoints(poly.points);
+        if (pieces.length <= 1) {
+            return [{ ...poly, points: pieces[0] || poly.points }];
+        }
+        const labelId = poly.labelId || createLabelId();
+        return pieces.map(points => ({
+            labelId,
+            classId: poly.classId,
+            points
+        }));
+    }
+
+    function expandZeroWidthBridgedPolygons(inputPolygons) {
+        return inputPolygons.flatMap(poly => expandZeroWidthBridgedPolygon(poly));
+    }
+
+    function escapeHtml(value) {
+        return String(value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+    }
+
+    function polygonBounds(poly) {
+        const xs = poly.points.map(p => p.x);
+        const ys = poly.points.map(p => p.y);
+        return {
+            minX: Math.min(...xs),
+            minY: Math.min(...ys),
+            maxX: Math.max(...xs),
+            maxY: Math.max(...ys)
+        };
+    }
+
+    function setActiveLabel(labelId, selectFirst = true) {
+        activeLabelId = labelId;
+        const group = labelGroups(true).find(item => item.labelId === labelId);
+        if (!group) return;
+        activeClassId = group.classId;
+        updateActiveClassButton(activeClassId);
+        if (selectFirst && group.items.length > 0 && !group.items.some(item => item.idx === selectedPolygonIndex)) {
+            selectedPolygonIndex = group.items[0].idx;
+        }
+    }
+
+    function selectPolygon(index, shouldZoom = false) {
+        if (index < 0 || index >= polygons.length) return;
+        if (!polygons[index].labelId) polygons[index].labelId = createLabelId();
+        selectedPolygonIndex = index;
+        hoveredPolygonIndex = -1;
+        hoveredVertexIndex = -1;
+        setActiveLabel(polygons[index].labelId, false);
+        if (shouldZoom) {
+            zoomToPolygon(index);
+            return;
+        }
+        draw();
+    }
+
+    function zoomToPolygon(index) {
+        const poly = polygons[index];
+        if (!poly || poly.points.length === 0) return;
+        const bounds = polygonBounds(poly);
+        const containerRect = container.getBoundingClientRect();
+        const width = Math.max(1, bounds.maxX - bounds.minX);
+        const height = Math.max(1, bounds.maxY - bounds.minY);
+        const fitScale = Math.min(containerRect.width / width, containerRect.height / height) * 0.45;
+        scale = Math.max(0.2, Math.min(15, fitScale));
+        const centerX = (bounds.minX + bounds.maxX) / 2;
+        const centerY = (bounds.minY + bounds.maxY) / 2;
+        offsetX = (containerRect.width / 2) - centerX * scale;
+        offsetY = (containerRect.height / 2) - centerY * scale;
+        draw();
+    }
+
+    function deletePolygon(index) {
+        if (index < 0 || index >= polygons.length) return;
+        polygons.splice(index, 1);
+        if (selectedPolygonIndex === index) {
+            selectedPolygonIndex = -1;
+        } else if (selectedPolygonIndex > index) {
+            selectedPolygonIndex--;
+        }
+        hoveredPolygonIndex = -1;
+        hoveredVertexIndex = -1;
+        if (activeLabelId && !polygons.some(poly => poly.labelId === activeLabelId)) {
+            activeLabelId = null;
+        }
+        saveHistory();
+        draw();
+    }
+
+    function splitBrushSize() {
+        const value = parseFloat(splitBrushSizeInput ? splitBrushSizeInput.value : '12');
+        return Number.isFinite(value) ? Math.max(2, Math.min(200, value)) : 12;
+    }
+
+    function setSplitBrushMode(enabled) {
+        splitBrushMode = !!enabled;
+        isSplitPainting = false;
+        splitStroke = [];
+        if (splitToolBtn) {
+            splitToolBtn.classList.toggle('bg-amber-600', splitBrushMode);
+            splitToolBtn.classList.toggle('hover:bg-amber-500', splitBrushMode);
+            splitToolBtn.classList.toggle('border-amber-400/60', splitBrushMode);
+            splitToolBtn.classList.toggle('bg-slate-800', !splitBrushMode);
+            splitToolBtn.classList.toggle('hover:bg-slate-700', !splitBrushMode);
+            splitToolBtn.textContent = splitBrushMode ? 'Split Brush ON' : 'Split Brush';
+        }
+        container.style.cursor = splitBrushMode ? 'cell' : 'crosshair';
+        draw();
+    }
+
+    async function applySplitBrushStroke() {
+        if (selectedPolygonIndex < 0 || selectedPolygonIndex >= polygons.length || splitStroke.length === 0) {
+            splitStroke = [];
+            draw();
+            return;
+        }
+        const originalIndex = selectedPolygonIndex;
+        const original = polygons[originalIndex];
+        try {
+            const resp = await fetch('/api/split_polygon_by_stroke', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    polygon: original,
+                    stroke: splitStroke,
+                    brush_radius: splitBrushSize(),
+                    image_width: sourceImage.width,
+                    image_height: sourceImage.height
+                })
+            });
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                throw new Error(err.detail || resp.statusText);
+            }
+            const data = await resp.json();
+            const replacement = (data.polygons || [])
+                .filter(p => p.points && p.points.length >= 3)
+                .map(p => ({
+                    labelId: p.labelId || original.labelId || createLabelId(),
+                    classId: p.classId,
+                    points: p.points
+                }));
+
+            polygons.splice(originalIndex, 1, ...replacement);
+            selectedPolygonIndex = replacement.length > 0 ? originalIndex : -1;
+            activeLabelId = replacement.length > 0 ? replacement[0].labelId : null;
+            saveHistory();
+        } catch (e) {
+            console.error(e);
+            alert('Failed to split polygon with brush.');
+        } finally {
+            splitStroke = [];
+            draw();
+        }
+    }
+
+    function renderPolygonList() {
+        if (!polygonListContainer) return;
+        ensurePolygonLabelIds();
+        const groups = labelGroups(true);
+        const signature = polygons.map((p, idx) => `${idx}:${p.labelId}:${p.classId}:${p.points.length}`).join('|') + `::${selectedPolygonIndex}::${activeLabelId || ''}::${activeClassId}`;
+        if (signature === polygonListSignature) return;
+        polygonListSignature = signature;
+
+        if (polygonListCount) {
+            polygonListCount.textContent = `${groups.length}`;
+        }
+        if (groups.length === 0) {
+            polygonListContainer.innerHTML = '<p class="text-xs text-slate-500 italic">No polygons</p>';
+            return;
+        }
+
+        polygonListContainer.innerHTML = '';
+        groups.forEach((labelGroup, groupIdx) => {
+            const { labelId, classId, items } = labelGroup;
+            const isActiveLabel = labelId === activeLabelId;
+            const groupEl = document.createElement('div');
+            groupEl.className = `rounded border ${isActiveLabel ? 'border-indigo-500/50 bg-indigo-500/10' : 'border-slate-700/60 bg-slate-900/40'} overflow-hidden`;
+            groupEl.innerHTML = `
+                <button type="button" class="polygon-group-header w-full flex items-center gap-2 px-2 py-1.5 text-left hover:bg-slate-800 transition-colors" data-label-id="${escapeHtml(labelId)}">
+                    <span class="w-2.5 h-2.5 rounded-sm flex-shrink-0" style="background-color: ${getClassColor(classId)}"></span>
+                    <span class="min-w-0 flex-1">
+                        <span class="block text-xs font-semibold ${isActiveLabel ? 'text-indigo-200' : 'text-slate-200'} truncate">Label ${groupIdx + 1}</span>
+                        <span class="block text-[10px] text-slate-500 truncate">${escapeHtml(classNameForId(classId))}</span>
+                    </span>
+                    <span class="text-[10px] text-slate-500">${items.length}</span>
+                </button>
+                <div class="divide-y divide-slate-800/80"></div>
+            `;
+            const rows = groupEl.querySelector('div');
+            if (items.length === 0) {
+                rows.innerHTML = '<div class="px-2 py-1.5 text-[10px] text-slate-500 italic">Next polygon will be added here.</div>';
+            }
+            items.forEach(({ poly, idx }, localIdx) => {
+                const isSelected = idx === selectedPolygonIndex;
+                const row = document.createElement('div');
+                row.className = `polygon-list-row flex items-center gap-1 px-2 py-1.5 ${isSelected ? 'bg-indigo-500/20' : 'hover:bg-slate-800/70'} transition-colors`;
+                row.dataset.polyIndex = idx;
+                row.innerHTML = `
+                    <button type="button" class="polygon-select flex-1 min-w-0 text-left" data-poly-index="${idx}">
+                        <span class="block text-xs ${isSelected ? 'text-indigo-200' : 'text-slate-300'} truncate">Polygon ${localIdx + 1}</span>
+                        <span class="block text-[10px] text-slate-500">${poly.points.length} pts</span>
+                    </button>
+                    <button type="button" class="polygon-zoom w-7 h-7 rounded flex items-center justify-center text-[10px] font-bold text-slate-400 hover:text-white hover:bg-slate-700" data-poly-index="${idx}" title="Zoom to polygon">Z</button>
+                    <button type="button" class="polygon-delete w-7 h-7 rounded flex items-center justify-center text-[10px] font-bold text-slate-500 hover:text-rose-200 hover:bg-rose-900/50" data-poly-index="${idx}" title="Delete polygon">X</button>
+                `;
+                rows.appendChild(row);
+            });
+            polygonListContainer.appendChild(groupEl);
+        });
+    }
+
+    if (polygonListContainer) {
+        polygonListContainer.addEventListener('click', (e) => {
+            const labelButton = e.target.closest('button[data-label-id]');
+            if (labelButton) {
+                setActiveLabel(labelButton.dataset.labelId, true);
+                draw();
+                return;
+            }
+            const button = e.target.closest('button[data-poly-index]');
+            if (!button) return;
+            const index = parseInt(button.dataset.polyIndex, 10);
+            if (Number.isNaN(index)) return;
+            if (button.classList.contains('polygon-delete')) {
+                deletePolygon(index);
+            } else if (button.classList.contains('polygon-zoom')) {
+                selectPolygon(index, true);
+            } else {
+                selectPolygon(index, false);
+            }
+        });
+    }
+
+    if (newLabelBtn) {
+        newLabelBtn.addEventListener('click', () => {
+            activeLabelId = createLabelId();
+            selectedPolygonIndex = -1;
+            hoveredPolygonIndex = -1;
+            hoveredVertexIndex = -1;
+            currentPolygon = null;
+            draw();
+        });
+    }
+
+    if (splitToolBtn) {
+        splitToolBtn.addEventListener('click', () => setSplitBrushMode(!splitBrushMode));
     }
 
     // Initialization
@@ -636,14 +1084,16 @@ document.addEventListener("DOMContentLoaded", () => {
             const resp = await fetch(`/api/labels?dataset=${window.DATASET_NAME}&label_path=${encodeURIComponent(window.LABEL_URL)}`);
             if (resp.ok) {
                 const data = await resp.json();
-                polygons = data.polygons.map(p => ({
+                polygons = expandZeroWidthBridgedPolygons(data.polygons.map(p => ({
+                    labelId: p.labelId || createLabelId(),
                     classId: p.classId,
                     // Convert normalized coordinates back to image pixel coordinates
                     points: p.points.map(pt => ({
                         x: pt.x * sourceImage.width,
                         y: pt.y * sourceImage.height
                     }))
-                }));
+                })));
+                ensurePolygonLabelIds();
                 draw();
                 saveHistory(); // Save initial state
             }
@@ -662,8 +1112,11 @@ document.addEventListener("DOMContentLoaded", () => {
         btn.innerText = "Saving...";
         btn.disabled = true;
 
+        ensurePolygonLabelIds();
+
         // Convert back to normalized coordinates
         const normalizedPolygons = polygons.filter(p => p.points.length >= 3).map(p => ({
+            labelId: p.labelId,
             classId: p.classId,
             points: p.points.map(pt => ({
                 x: pt.x / sourceImage.width,
@@ -702,6 +1155,9 @@ document.addEventListener("DOMContentLoaded", () => {
                         }
                     } catch (_) { /* non-fatal */ }
                 }
+                window.IS_AUTO_UNREVIEWED = false;
+                const reviewBanner = document.getElementById('auto-unreviewed-banner');
+                if (reviewBanner) reviewBanner.classList.add('hidden');
                 btn.classList.remove('bg-indigo-600', 'bg-emerald-600');
                 btn.classList.add('bg-emerald-600');
                 btn.innerText = "Saved!";
@@ -979,7 +1435,9 @@ document.addEventListener("DOMContentLoaded", () => {
             } else if (e.button === 2) { // Right click: Close polygon or delete point
                 if (currentPolygon) {
                     if (currentPolygon.points.length > 2) {
+                        if (!currentPolygon.labelId) currentPolygon.labelId = activeLabelId || createLabelId();
                         polygons.push(currentPolygon);
+                        activeLabelId = currentPolygon.labelId;
                         saveHistory();
                     }
                     currentPolygon = null;
@@ -987,13 +1445,31 @@ document.addEventListener("DOMContentLoaded", () => {
                 } else if (hoveredVertexIndex !== -1 && selectedPolygonIndex !== -1) {
                     polygons[selectedPolygonIndex].points.splice(hoveredVertexIndex, 1);
                     if (polygons[selectedPolygonIndex].points.length < 3) {
-                        polygons.splice(selectedPolygonIndex, 1);
-                        selectedPolygonIndex = -1;
+                        deletePolygon(selectedPolygonIndex);
+                        hoveredVertexIndex = -1;
+                        return;
                     }
                     saveHistory();
                     hoveredVertexIndex = -1;
                     draw();
                 }
+            }
+            e.preventDefault();
+            return;
+        }
+
+        if (splitBrushMode && e.button === 0) {
+            const pos = getMousePos(e);
+            if (selectedPolygonIndex < 0) {
+                const clickedIdx = findPolygonAtPos(pos);
+                if (clickedIdx !== -1) {
+                    selectPolygon(clickedIdx, false);
+                }
+            }
+            if (selectedPolygonIndex >= 0) {
+                isSplitPainting = true;
+                splitStroke = [pos];
+                draw();
             }
             e.preventDefault();
             return;
@@ -1012,19 +1488,14 @@ document.addEventListener("DOMContentLoaded", () => {
                 // Check if we clicked on an existing polygon to select it
                 const clickedIdx = findPolygonAtPos(pos);
                 if (clickedIdx !== -1) {
-                    selectedPolygonIndex = clickedIdx;
-
-                    const clickedClass = polygons[clickedIdx].classId;
-                    const btn = document.querySelector(`.class-selector[data-class-id="${clickedClass}"]`);
-                    if (btn) btn.click();
-
-                    draw();
+                    selectPolygon(clickedIdx, false);
                     return;
                 }
 
                 selectedPolygonIndex = -1;
                 // Start new polygon
-                currentPolygon = { classId: activeClassId, points: [pos] };
+                if (!activeLabelId) activeLabelId = createLabelId();
+                currentPolygon = { labelId: activeLabelId, classId: activeClassId, points: [pos] };
             } else {
                 // Add point
                 currentPolygon.points.push(pos);
@@ -1043,6 +1514,15 @@ document.addEventListener("DOMContentLoaded", () => {
         }
 
         const pos = getMousePos(e);
+
+        if (splitBrushMode && isSplitPainting) {
+            const last = splitStroke[splitStroke.length - 1];
+            if (!last || Math.hypot(last.x - pos.x, last.y - pos.y) >= 1) {
+                splitStroke.push(pos);
+            }
+            draw();
+            return;
+        }
 
         if (isDraggingVertex && selectedPolygonIndex !== -1 && hoveredVertexIndex !== -1) {
             polygons[selectedPolygonIndex].points[hoveredVertexIndex] = pos;
@@ -1086,6 +1566,11 @@ document.addEventListener("DOMContentLoaded", () => {
             isPanning = false;
             container.style.cursor = currentPolygon ? 'crosshair' : (hoveredPolygonIndex !== -1 ? 'pointer' : 'crosshair');
         } else if (e.button === 0) {
+            if (splitBrushMode && isSplitPainting) {
+                isSplitPainting = false;
+                applySplitBrushStroke();
+                return;
+            }
             if (isDraggingVertex) {
                 isDraggingVertex = false;
                 saveHistory();
@@ -1106,14 +1591,14 @@ document.addEventListener("DOMContentLoaded", () => {
                 if (hoveredVertexIndex !== -1) {
                     polygons[selectedPolygonIndex].points.splice(hoveredVertexIndex, 1);
                     if (polygons[selectedPolygonIndex].points.length < 3) {
-                        polygons.splice(selectedPolygonIndex, 1);
-                        selectedPolygonIndex = -1;
+                        deletePolygon(selectedPolygonIndex);
+                        hoveredVertexIndex = -1;
+                        return;
                     }
                     hoveredVertexIndex = -1;
                 } else {
-                    polygons.splice(selectedPolygonIndex, 1);
-                    selectedPolygonIndex = -1;
-                    hoveredPolygonIndex = -1;
+                    deletePolygon(selectedPolygonIndex);
+                    return;
                 }
                 saveHistory();
                 draw();
@@ -1135,6 +1620,12 @@ document.addEventListener("DOMContentLoaded", () => {
                     negChk.click();
                     e.preventDefault();
                 }
+            }
+        } else if (e.key === 'b' || e.key === 'B') {
+            const activeTag = document.activeElement ? document.activeElement.tagName.toLowerCase() : '';
+            if (activeTag !== 'input' && activeTag !== 'textarea') {
+                setSplitBrushMode(!splitBrushMode);
+                e.preventDefault();
             }
         }
     });
@@ -1273,5 +1764,23 @@ document.addEventListener("DOMContentLoaded", () => {
                 ctx.fill();
             }
         }
+
+        if (splitBrushMode && splitStroke.length > 0) {
+            ctx.save();
+            ctx.globalAlpha = 0.9;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.lineWidth = splitBrushSize() * 2;
+            ctx.strokeStyle = '#f59e0b';
+            ctx.beginPath();
+            splitStroke.forEach((p, i) => {
+                if (i === 0) ctx.moveTo(p.x, p.y);
+                else ctx.lineTo(p.x, p.y);
+            });
+            ctx.stroke();
+            ctx.restore();
+        }
+
+        renderPolygonList();
     }
 });

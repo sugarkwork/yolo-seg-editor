@@ -38,6 +38,7 @@
     window.IMAGE_URL = "{{ image_url }}";
     window.LABEL_URL = "{{ label_url }}";
     window.CLASSES = {{ classes | tojson }};
+    window.IS_AUTO_UNREVIEWED = {{ 'true' if is_auto_unreviewed else 'false' }};
 </script>
 {% endblock %}
 
@@ -119,17 +120,23 @@
 {% endblock %}
 
 {% block content %}
-<div class="flex flex-col lg:flex-row gap-6 h-[calc(100vh-10rem)]">
-    <!-- Tools & Classes sidebar -->
-    <div class="lg:w-64 flex-shrink-0 flex flex-col gap-6 h-full">
+{% if is_auto_unreviewed %}
+<div id="auto-unreviewed-banner"
+    class="mb-3 rounded border border-amber-500/40 bg-amber-950/30 px-4 py-2 text-sm text-amber-100">
+    Auto-labeled and waiting for human review. Saving this image clears the review flag.
+</div>
+{% endif %}
+<div class="flex flex-col xl:flex-row gap-6 h-[calc(100vh-10rem)]">
+    <!-- Classes & Labels sidebar -->
+    <div class="xl:w-64 flex-shrink-0 flex flex-col gap-4 h-full min-h-0 order-1">
         <!-- Classes Tool -->
-        <div class="glass-panel p-4 flex flex-col flex-grow min-h-0">
+        <div class="glass-panel p-4 flex flex-col flex-none max-h-[38%] min-h-40">
             <h3
                 class="flex items-center justify-between text-xs font-bold uppercase tracking-wider text-slate-300 mb-4 pb-2 border-b border-slate-700/50">
                 ACTIVE CLASS
             </h3>
 
-            <div id="class-list-container" class="space-y-2 flex-1 min-h-0 overflow-y-auto">
+            <div id="class-list-container" class="space-y-2 flex-1 min-h-0 overflow-y-auto pr-1">
                 {% for name in classes %}
                 <button
                     class="class-selector w-full flex items-center gap-2 p-2 rounded text-left transition-colors {% if loop.index0 == 0 %}bg-indigo-500/20 border border-indigo-500/50 text-indigo-300{% else %}bg-slate-800/50 hover:bg-slate-700 text-slate-300 border border-transparent{% endif %}"
@@ -149,6 +156,36 @@
             </div>
         </div>
 
+        <!-- Existing Labels Panel -->
+        <div class="glass-panel p-4 flex flex-col flex-1 min-h-0">
+            <h3
+                class="flex items-center justify-between text-xs font-bold uppercase tracking-wider text-slate-300 mb-3 pb-2 border-b border-slate-700/50">
+                LABELS
+                <span id="polygon-list-count" class="text-[10px] text-slate-500 font-semibold tracking-normal">0</span>
+            </h3>
+            <div id="polygon-list-container" class="flex-1 min-h-0 overflow-y-auto space-y-2 pr-1">
+                <p class="text-xs text-slate-500 italic">No polygons</p>
+            </div>
+            <button id="new-label-btn"
+                class="mt-3 w-full bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium py-1.5 px-3 rounded text-xs transition-colors border border-slate-700">
+                New Label
+            </button>
+            <div class="mt-2 grid grid-cols-[1fr_4.5rem] gap-2">
+                <button id="split-tool-btn"
+                    class="bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium py-1.5 px-3 rounded text-xs transition-colors border border-slate-700"
+                    title="Toggle split brush (B)">
+                    Split Brush
+                </button>
+                <input type="number" id="split-brush-size" value="12" min="2" max="200" step="1"
+                    class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 w-full"
+                    title="Brush size in image pixels">
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Image Actions sidebar -->
+    <div class="xl:w-72 flex-shrink-0 flex flex-col gap-6 h-full overflow-y-auto order-3">
         <!-- Auto-Segment Panel -->
         <div class="glass-panel p-4 flex flex-col gap-3">
             <h3
@@ -193,6 +230,40 @@
                 </div>
             </div>
 
+            <!-- Padding Inference Options -->
+            <div class="flex flex-col gap-2 py-2 border-b border-slate-700/50">
+                <label class="flex items-center gap-2 cursor-pointer group">
+                    <input type="checkbox" id="use-padding-inference-chk" class="w-3 h-3 rounded bg-slate-900 border-slate-700 text-indigo-500 focus:ring-indigo-500 cursor-pointer">
+                    <span class="text-xs text-slate-300 group-hover:text-white transition-colors">Use Padding Inference</span>
+                </label>
+
+                <div id="padding-inference-params" class="hidden grid grid-cols-2 gap-2 mt-1">
+                    <div class="flex flex-col">
+                        <label class="text-[9px] text-slate-400 uppercase tracking-widest">Pad Y %</label>
+                        <input type="number" id="pad-y-percent" value="30" min="0" max="200" step="5" class="bg-slate-900 border border-slate-700 rounded px-1.5 py-1 text-xs text-slate-300 w-full">
+                    </div>
+                    <div class="flex flex-col">
+                        <label class="text-[9px] text-slate-400 uppercase tracking-widest">Pad X %</label>
+                        <input type="number" id="pad-x-percent" value="0" min="0" max="200" step="5" class="bg-slate-900 border border-slate-700 rounded px-1.5 py-1 text-xs text-slate-300 w-full">
+                    </div>
+                    <div class="flex flex-col">
+                        <label class="text-[9px] text-slate-400 uppercase tracking-widest">Large %</label>
+                        <input type="number" id="padding-large-threshold" value="60" min="1" max="100" step="5" class="bg-slate-900 border border-slate-700 rounded px-1.5 py-1 text-xs text-slate-300 w-full">
+                    </div>
+                    <div class="flex flex-col">
+                        <label class="text-[9px] text-slate-400 uppercase tracking-widest">Match IoU</label>
+                        <input type="number" id="padding-match-iou" value="0.2" min="0" max="1" step="0.05" class="bg-slate-900 border border-slate-700 rounded px-1.5 py-1 text-xs text-slate-300 w-full">
+                    </div>
+                    <div class="flex flex-col col-span-2">
+                        <label class="text-[9px] text-slate-400 uppercase tracking-widest">Merge</label>
+                        <select id="padding-merge-mode" class="bg-slate-900 border border-slate-700 rounded px-1.5 py-1 text-xs text-slate-300 w-full">
+                            <option value="large_only">大型判定のみマージ</option>
+                            <option value="all">全マージ</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+
             <button id="auto-segment-btn"
                 class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-1.5 px-3 rounded text-xs transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex justify-center items-center gap-2 mt-1">
                 <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24"
@@ -204,17 +275,23 @@
             </button>
             <p id="ai-error" class="text-rose-400 text-[10px] mt-1 hidden text-center"></p>
 
-            <!-- Polygon Shrink -->
+            <!-- Polygon Shrink / Expand -->
             <div class="mt-2 pt-3 border-t border-slate-700/50 flex flex-col gap-2">
-                <div class="flex items-end gap-2">
-                    <div class="flex flex-col flex-grow">
-                        <label class="text-[9px] text-slate-400 uppercase tracking-widest">Shrink % (of bbox short side)</label>
-                        <input type="number" id="shrink-percent" value="1.0" min="0" step="0.5" class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 w-full">
+                <div class="flex flex-col gap-2">
+                    <div class="flex flex-col w-full">
+                        <label class="text-[9px] text-slate-400 uppercase tracking-widest">Shrink / Expand % (of bbox short side)</label>
+                        <input type="number" id="shrink-percent" value="1.0" min="0.1" max="100" step="0.5" class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 w-full">
                     </div>
-                    <button id="shrink-btn"
-                        class="bg-slate-700 hover:bg-slate-600 text-slate-100 font-medium py-1.5 px-3 rounded text-xs transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
-                        Shrink
-                    </button>
+                    <div class="grid grid-cols-2 gap-2">
+                        <button id="shrink-btn"
+                            class="bg-slate-700 hover:bg-slate-600 text-slate-100 font-medium py-1.5 px-3 rounded text-xs transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                            Shrink
+                        </button>
+                        <button id="expand-btn"
+                            class="bg-sky-700 hover:bg-sky-600 text-slate-100 font-medium py-1.5 px-3 rounded text-xs transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                            Expand
+                        </button>
+                    </div>
                 </div>
                 <p class="text-[10px] text-slate-400 leading-tight">Applies to selected polygon if any, otherwise all polygons.</p>
                 <p id="shrink-error" class="text-rose-400 text-[10px] hidden text-center"></p>
@@ -304,7 +381,7 @@
     </div>
 
     <!-- Canvas Editor Area -->
-    <div class="flex-grow glass-panel relative overflow-hidden flex items-center justify-center p-0 no-select"
+    <div class="flex-grow min-w-0 glass-panel relative overflow-hidden flex items-center justify-center p-0 no-select order-2"
         id="editor-container">
         <!-- Background dotted pattern for transparency feeling -->
         <div class="absolute inset-0 z-0 opacity-10 pointer-events-none"
@@ -331,5 +408,5 @@
 </div>
 
 <!-- Add vanilla JS script -->
-<script src="/static/js/editor.js?v=negsample1"></script>
+<script src="/static/js/editor.js?v=split-brush1"></script>
 {% endblock %}
